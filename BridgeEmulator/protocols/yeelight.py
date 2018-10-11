@@ -5,6 +5,7 @@ import socket
 
 from functions import light_types, nextFreeId
 from functions.colors import convert_rgb_xy, convert_xy
+from HueEmulator3 import getIpAddress
 
 
 def discover(bridge_config, new_lights):
@@ -60,15 +61,92 @@ def discover(bridge_config, new_lights):
             sock.close()
             break
 
+
+connected_request_handlers = {}
+open_sockets = {}
+
+
+def handle_request(request_handler):
+    # Bulb is creating a TCP socket with the server
+    ip = request_handler.client_address[0]
+
+    if ip in connected_request_handlers:
+        connected_request_handlers[ip].close_connection = True
+        connected_request_handlers[ip].request.close()
+        del connected_request_handlers[ip]
+
+    connected_request_handlers[ip] = request_handler
+
+
+def finish_request(request_handler):
+    ip = request_handler.client_address[0]
+    del connected_request_handlers[ip]
+
+
+def close_music_socket(ip):
+    connected_request_handlers[ip].close_connection = True
+    connected_request_handlers[ip].request.close()
+    del connected_request_handlers[ip]
+
+
+def close_open_socket(ip):
+    open_sockets[ip].close()
+    del open_sockets[ip]
+
+
+def new_socket(ip):
+    tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp_socket.settimeout(5)
+    tcp_socket.connect((ip, int(55443)))
+
+    msg = json.dumps({"id": 1, "method": "set_music", "params": [0]}) + "\r\n"
+    tcp_socket.send(msg.encode())
+    msg = json.dumps({"id": 1, "method": "set_music", "params": [
+                     1, getIpAddress(), 80]}) + "\r\n"
+    tcp_socket.send(msg.encode())
+
+    open_sockets[ip] = tcp_socket
+
+    return tcp_socket
+
+
+def select_socket(ip):
+    if ip in connected_request_handlers:
+        return connected_request_handlers[ip].request, 'music'
+    elif ip in open_sockets:
+        return open_sockets[ip], 'open'
+    return None, None
+
+
 def command(ip, api_method, param):
+    socket, mode = select_socket(ip)
+
+    print(mode)
     try:
-        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp_socket.settimeout(5)
-        tcp_socket.connect((ip, int(55443)))
-        msg = json.dumps({"id": 1, "method": api_method, "params": param}) + "\r\n"
-        tcp_socket.send(msg.encode())
-        tcp_socket.close()
-    except Exception:
+        if socket is None:
+            socket, mode = new_socket(ip), 'open'
+    except Exception as ex:
+        logging.exception("Unexpected error")
+        return
+
+    try:
+        msg = json.dumps(
+            {"id": 1, "method": api_method, "params": param}) + "\r\n"
+
+        socket.send(msg.encode())
+
+    except ConnectionError as ex:
+        logging.exception("Unexpected error")
+
+        if mode == 'music':
+            close_music_socket(ip)
+        elif mode == 'open':
+            close_open_socket(ip)
+
+        if mode == 'music':
+            return command(ip, api_method, param)
+
+    except Exception as ex:
         logging.exception("Unexpected error")
 
 
@@ -103,6 +181,7 @@ def set_light(ip, light, data):
     # check if hue wants to change brightness
     for key, value in payload.items():
         command(ip, key, value)
+
 
 def get_light_state(ip, light):
     state = {}
