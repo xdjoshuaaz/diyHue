@@ -19,7 +19,7 @@ rm -rf astral.zip astral-master/
 
 ### installing hue emulator
 echo -e "\033[36m Installing Hue Emulator.\033[0m"
-wget -q https://github.com/mariusmotea/diyHue/archive/master.zip -O diyHue.zip
+wget -q https://github.com/xdjoshuaaz/diyHue/archive/yeelight-music-mode.zip -O diyHue.zip
 unzip -q -o  diyHue.zip
 cd diyHue-master/BridgeEmulator/
 
