@@ -90,6 +90,9 @@ def entertainmentService():
                             b = int((data[i+7] * 256 + data[i+8]) / (256 + 1))
                             if lightId not in lightStatus:
                                 lightStatus[lightId] = {"on": False, "bri": 1}
+
+                            prev_xy = bridge_config["lights"][str(lightId)]["state"]["xy"]
+
                             if r == 0 and  g == 0 and  b == 0:
                                 bridge_config["lights"][str(lightId)]["state"]["on"] = False
                             else:
@@ -99,19 +102,30 @@ def entertainmentService():
                                     nativeLights[bridge_config["lights_address"][str(lightId)]["ip"]] = {}
                                 nativeLights[bridge_config["lights_address"][str(lightId)]["ip"]][bridge_config["lights_address"][str(lightId)]["light_nr"] - 1] = [r, g, b]
                             else:
-                                if fremeID == 24: # => every seconds, increase in case the destination device is overloaded
+                                yeelight = bridge_config["lights_address"][str(lightId)]["protocol"] == "yeelight"
+                                if yeelight or fremeID == 24:  # => every seconds, increase in case the destination device is overloaded
+                                    patch = {}
                                     if r == 0 and  g == 0 and  b == 0:
                                         if lightStatus[lightId]["on"]:
-                                            sendLightRequest(str(lightId), {"on": False, "transitiontime": 3})
+                                            patch.update({"on": False, "transitiontime": 3})
                                             lightStatus[lightId]["on"] = False
                                     elif lightStatus[lightId]["on"] == False:
-                                        sendLightRequest(str(lightId), {"on": True, "transitiontime": 3})
+                                        patch.update({"on": True, "transitiontime": 3})
                                         lightStatus[lightId]["on"] = True
-                                    elif abs(int((r + b + g) / 3) - lightStatus[lightId]["bri"]) > 50: # to optimize, send brightness  only of difference is bigger than this value
-                                        sendLightRequest(str(lightId), {"bri": int((r + b + g) / 3), "transitiontime": 3})
-                                        lightStatus[lightId]["bri"] = int((r + b + g) / 3)
-                                    else:
-                                        sendLightRequest(str(lightId), {"xy": convert_rgb_xy(r, g, b), "transitiontime": 3})
+
+                                    if lightStatus[lightId]["on"]:
+                                        xy = convert_rgb_xy(r, g, b)
+
+                                        if abs(int((r + b + g) / 3) - lightStatus[lightId]["bri"]) > 30: # to optimize, send brightness  only of difference is bigger than this value
+                                            patch.update({"bri": int((r + b + g) / 3), "transitiontime": 3})
+                                            lightStatus[lightId]["bri"] = int((r + b + g) / 3)
+
+                                        if xy != prev_xy:
+                                            patch.update({"xy": convert_rgb_xy(r, g, b), "transitiontime": 3})
+                                    
+                                    if len(patch.keys()) > 0:
+                                        sendLightRequest(str(lightId), patch)
+
                             fremeID += 1
                             if fremeID == 25:
                                 fremeID = 0
@@ -135,9 +149,13 @@ def entertainmentService():
                                     nativeLights[bridge_config["lights_address"][str(lightId)]["ip"]] = {}
                                 nativeLights[bridge_config["lights_address"][str(lightId)]["ip"]][bridge_config["lights_address"][str(lightId)]["light_nr"] - 1] = convert_xy(x, y, bri)
                             else:
+                                yeelight = bridge_config["lights_address"][str(lightId)]["protocol"] == "yeelight"
+
                                 fremeID += 1
-                                if fremeID == 24 : #24 = every seconds, increase in case the destination device is overloaded
-                                    sendLightRequest(str(lightId), {"xy": [x,y]})
+                                if yeelight or fremeID == 25 : #24 = every seconds, increase in case the destination device is overloaded
+                                    sendLightRequest(str(lightId), {"xy": [x, y], "bri": bri})
+                                    
+                                if fremeID == 25:
                                     fremeID = 0
                             updateGroupStats(lightId)
         if len(nativeLights) is not 0:
