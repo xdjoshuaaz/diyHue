@@ -1060,10 +1060,65 @@ def daylightSensor():
         logging.debug("set daylight sensor to false")
 
 
-class S(BaseHTTPRequestHandler):
+class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     server_version = 'nginx'
     sys_version = ''
+
+    light_protocol = None
+    light = None
+    light_id = None
+
+    def __init__(self, request, client_address, server):
+        client_ip = client_address[0]
+
+        for light_id in bridge_config["lights_address"]:
+            light = bridge_config["lights_address"][light_id]
+
+            if light["ip"] == client_ip:
+                self.light = light
+                self.light_id = light_id
+
+                protocol_name = light["protocol"]
+
+                for protocol in protocols:
+                    if "protocols." + protocol_name == protocol.__name__:
+                        self.light_protocol = protocol
+                        break
+                break
+
+        super().__init__(request, client_address, server)
+
+    def handle(self):
+        forward_to_http = self.invoke_light_protocol_method('handle_request', self, default=True)
+
+        if forward_to_http:
+            super().handle()
+        else:
+            self.close_connection = False
+            while not self.close_connection:
+                if self.rfile.read() == b'':
+                    self.close_connection = True
+
+    def finish(self):
+        self.invoke_light_protocol_method('finish_request', self)
+            
+        super().finish()
+
+    def invoke_light_protocol_method(self, method_name, *args, **kwargs):
+        if self.light_protocol is not None:
+            try:
+                method = getattr(self.light_protocol, method_name)
+                return method(*args)
+            except AttributeError:
+                pass
+                
+        return kwargs.get('default')
+
+
+    def find_protocol_for_request(self):
+
+        return None
 
     def _set_headers(self):
         self.send_response(200)
@@ -1606,7 +1661,7 @@ class S(BaseHTTPRequestHandler):
 class ThreadingSimpleServer(ThreadingMixIn, HTTPServer):
     pass
 
-def run(https, server_class=ThreadingSimpleServer, handler_class=S):
+def run(https, server_class=ThreadingSimpleServer, handler_class=HueEmulatorRequestHandler):
     if https:
         server_address = ('', 443)
         httpd = server_class(server_address, handler_class)
