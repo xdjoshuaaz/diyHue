@@ -85,9 +85,9 @@ def entertainmentService():
                     if data[i] == 0: #Type of device 0x00 = Light
                         lightId = data[i+1] * 256 + data[i+2]
                         if lightId != 0:
-                            r = int((data[i+3] * 256 + data[i+4]) / 256)
-                            g = int((data[i+5] * 256 + data[i+6]) / 256)
-                            b = int((data[i+7] * 256 + data[i+7]) / 256)
+                            r = int((data[i+3] * 256 + data[i+4]) / (256 + 1))
+                            g = int((data[i+5] * 256 + data[i+6]) / (256 + 1))
+                            b = int((data[i+7] * 256 + data[i+8]) / (256 + 1))
                             if lightId not in lightStatus:
                                 lightStatus[lightId] = {"on": False, "bri": 1}
                             if r == 0 and  g == 0 and  b == 0:
@@ -125,7 +125,7 @@ def entertainmentService():
                         if lightId != 0:
                             x = (data[i+3] * 256 + data[i+4]) / 65535
                             y = (data[i+5] * 256 + data[i+6]) / 65535
-                            bri = int((data[i+7] * 256 + data[i+7]) / 256)
+                            bri = int((data[i+7] * 256 + data[i+8]) / (256 + 1))
                             if bri == 0:
                                 bridge_config["lights"][str(lightId)]["state"]["on"] = False
                             else:
