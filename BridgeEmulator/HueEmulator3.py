@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from subprocess import Popen, check_output
-from threading import Thread
+from threading import Thread, current_thread
 from time import sleep, strftime
 from urllib.parse import parse_qs, urlparse
 
@@ -89,9 +89,7 @@ def entertainmentService():
                             g = int((data[i+5] * 256 + data[i+6]) / (256 + 1))
                             b = int((data[i+7] * 256 + data[i+8]) / (256 + 1))
                             if lightId not in lightStatus:
-                                lightStatus[lightId] = {"on": False, "bri": 1}
-
-                            prev_xy = bridge_config["lights"][str(lightId)]["state"]["xy"]
+                                lightStatus[lightId] = {"on": False, "bri": 1, "xy": [-999, -999], "rgb": (-1, -1, -1)}
 
                             if r == 0 and  g == 0 and  b == 0:
                                 bridge_config["lights"][str(lightId)]["state"]["on"] = False
@@ -116,12 +114,19 @@ def entertainmentService():
                                     if lightStatus[lightId]["on"]:
                                         xy = convert_rgb_xy(r, g, b)
 
-                                        if abs(int((r + b + g) / 3) - lightStatus[lightId]["bri"]) > 30: # to optimize, send brightness  only of difference is bigger than this value
-                                            patch.update({"bri": int((r + b + g) / 3), "transitiontime": 3})
-                                            lightStatus[lightId]["bri"] = int((r + b + g) / 3)
+                                        if (r, g, b) != lightStatus[lightId]["rgb"]:
+                                            bri = int((r + b + g) / 3)
+                                            if abs(bri - lightStatus[lightId]["bri"]) >= 3:
+                                                patch.update({"bri": bri, "transitiontime": 3})
+                                                lightStatus[lightId]["bri"] = bri
 
-                                        if xy != prev_xy:
-                                            patch.update({"xy": convert_rgb_xy(r, g, b), "transitiontime": 3})
+                                            xy = convert_rgb_xy(r, g, b)
+                                            if xy != lightStatus[lightId]["xy"]:
+                                                patch.update({"xy": convert_rgb_xy(r, g, b), "transitiontime": 3})
+                                                lightStatus[lightId]["xy"] = xy
+                                                
+                                            patch.update({"rgb": (r, g, b)})
+                                            lightStatus[lightId]["rgb"] = (r, g, b)
                                     
                                     if len(patch.keys()) > 0:
                                         sendLightRequest(str(lightId), patch)
@@ -143,7 +148,8 @@ def entertainmentService():
                             if bri == 0:
                                 bridge_config["lights"][str(lightId)]["state"]["on"] = False
                             else:
-                                bridge_config["lights"][str(lightId)]["state"].update({"on": True, "bri": bri, "xy": [x,y], "colormode": "xy"})
+                                bridge_config["lights"][str(lightId)]["state"].update({"on": True, "bri": bri, "xy": [x, y], "colormode": "xy"})
+                                
                             if bridge_config["lights_address"][str(lightId)]["protocol"] == "native":
                                 if bridge_config["lights_address"][str(lightId)]["ip"] not in nativeLights:
                                     nativeLights[bridge_config["lights_address"][str(lightId)]["ip"]] = {}
@@ -1089,21 +1095,24 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
 
         super().__init__(request, client_address, server)
 
+    def setup(self):
+        if not self.invoke_light_protocol_method('setup_request', self):
+            super().setup()
+
     def handle(self):
-        forward_to_http = self.invoke_light_protocol_method('handle_request', self, default=True)
-
-        if forward_to_http:
+        if not self.invoke_light_protocol_method('handle_request', self):
             super().handle()
-        else:
-            self.close_connection = False
-            while not self.close_connection:
-                if self.rfile.read() == b'':
-                    self.close_connection = True
 
-    def finish(self):
-        self.invoke_light_protocol_method('finish_request', self)
-            
-        super().finish()
+    def finish(self, force=False):
+        if not self.invoke_light_protocol_method('finish_request', self):
+            super().finish()
+
+    def parse_request(self):
+        result = super().parse_request()
+        if result:
+            current_thread().name = "{0} {1} {2}".format(self.command, self.path, self.client_address[0])
+        
+        return result
 
     def invoke_light_protocol_method(self, method_name, *args, **kwargs):
         if self.light_protocol is not None:
@@ -1113,12 +1122,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
             except AttributeError:
                 pass
                 
-        return kwargs.get('default')
-
-
-    def find_protocol_for_request(self):
-
-        return None
+        return kwargs.get('default', False)
 
     def _set_headers(self):
         self.send_response(200)
@@ -1548,7 +1552,6 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                                 bridge_config["lights"][light]["state"]["colormode"] = "hs"
                             Thread(target=sendLightRequest, args=[light, bridge_config["scenes"][put_dictionary["scene"]]["lightstates"][light]]).start()
                             updateGroupStats(light)
-                            sleep(0.1)
                     elif "bri_inc" in put_dictionary:
                         bridge_config["groups"][url_pices[4]]["action"]["bri"] += int(put_dictionary["bri_inc"])
                         if bridge_config["groups"][url_pices[4]]["action"]["bri"] > 254:
@@ -1580,7 +1583,6 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                             if "virtual_light" not in bridge_config["alarm_config"] or light != bridge_config["alarm_config"]["virtual_light"]:
                                 bridge_config["lights"][light]["state"].update(put_dictionary)
                                 Thread(target=sendLightRequest, args=[light, put_dictionary]).start()
-                                sleep(0.1)
                         for group in bridge_config["groups"].keys():
                             bridge_config["groups"][group][url_pices[5]].update(put_dictionary)
                             if "on" in put_dictionary:
@@ -1594,16 +1596,20 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                         for light in bridge_config["groups"][url_pices[4]]["lights"]:
                             bridge_config["lights"][light]["state"].update(put_dictionary)
                             Thread(target=sendLightRequest, args=[light, put_dictionary]).start()
-                            sleep(0.1)
                 elif url_pices[3] == "lights": #state is applied to a light
-                    for key in put_dictionary.keys():
+                #jb
+                    for key, value in put_dictionary.items():
                         if key in ["ct", "xy"]: #colormode must be set by bridge
                             bridge_config["lights"][url_pices[4]]["state"]["colormode"] = key
                         elif key in ["hue", "sat"]:
                             bridge_config["lights"][url_pices[4]]["state"]["colormode"] = "hs"
+                    
+                    if "on" in put_dictionary:
+                        if bridge_config["lights"][url_pices[4]]["state"]["on"] == put_dictionary["on"]:
+                            del put_dictionary["on"]
+
                     updateGroupStats(url_pices[4])
                     Thread(target=sendLightRequest,args=[url_pices[4], put_dictionary]).start()
-                    sleep(0.1)
                 if not url_pices[4] == "0": #group 0 is virtual, must not be saved in bridge configuration
                     try:
                         bridge_config[url_pices[3]][url_pices[4]][url_pices[5]].update(put_dictionary)
@@ -1689,14 +1695,14 @@ if __name__ == "__main__":
     try:
         if update_lights_on_startup:
             updateAllLights()
-        Thread(target=ssdpSearch, args=[getIpAddress(), mac]).start()
-        Thread(target=ssdpBroadcast, args=[getIpAddress(), mac]).start()
-        Thread(target=schedulerProcessor).start()
-        Thread(target=syncWithLights).start()
-        Thread(target=entertainmentService).start()
-        Thread(target=run, args=[False]).start()
-        Thread(target=run, args=[True]).start()
-        Thread(target=daylightSensor).start()
+        Thread(target=ssdpSearch, name="ssdpSearch", args=[getIpAddress(), mac]).start()
+        Thread(target=ssdpBroadcast, name="ssdpBroadcast", args=[getIpAddress(), mac]).start()
+        Thread(target=schedulerProcessor, name="schedulerProcessor").start()
+        Thread(target=syncWithLights, name="syncWithLights").start()
+        Thread(target=entertainmentService, name="entertainmentService").start()
+        Thread(target=run, name="http", args=[False]).start()
+        Thread(target=run, name="https", args=[True]).start()
+        Thread(target=daylightSensor, name="daylightSensor").start()
         while True:
             sleep(10)
     except Exception:
