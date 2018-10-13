@@ -10,6 +10,7 @@ import ssl
 import sys
 import urllib.parse
 import urllib.request
+import subprocess
 from collections import defaultdict
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -18,6 +19,8 @@ from subprocess import Popen, check_output
 from threading import Thread, current_thread
 from time import sleep, strftime
 from urllib.parse import parse_qs, urlparse
+import platform
+import shutil
 
 import requests
 
@@ -31,9 +34,74 @@ from protocols import yeelight
 protocols = [yeelight]
 
 cwd = os.path.split(os.path.abspath(__file__))[0]
-docker = False # Set only to true if using script in Docker container
+docker = False  # Set only to true if using script in Docker container
 
-update_lights_on_startup = False # if set to true all lights will be updated with last know state on startup.
+# if set to true all lights will be updated with last know state on startup.
+update_lights_on_startup = False
+
+run_service = True
+
+bridge_config = defaultdict(lambda:defaultdict(str))
+new_lights = {}
+sensors_state = {}
+
+debug = False
+
+def checkEnvironment():
+    global linux_compatible
+    linux_compatible = True
+
+    logging.info('Running on %s', platform.system())
+    if (platform.system() == 'Windows'):
+        wsl = shutil.which("wsl.exe")
+        linux_compatible = wsl is not None
+        has_specified_args = len(sys.argv) >= 2
+
+        logging.info("WSL path: %s", wsl)
+
+        if not linux_compatible and not has_specified_args:
+            raise Exception('''Running on Windows requires either that;
+            a) the Windows Subsystem for Linux (WSL, aka Bash on Ubuntu on Windows) is installed,
+            b) host MAC and IP addresses are passed as command-line arguments in the order shown respectively.
+
+            To install WSL, visit https://docs.microsoft.com/en-us/windows/wsl/install-win10 ''')
+
+def setServerConfig():
+    global mac
+    if len(sys.argv) == 3:
+        mac = str(sys.argv[1]).replace(":", "")
+        logging.info("MAC %s from cmd args", mac)
+    else:
+        mac = xplat_check_output("cat /sys/class/net/$(ip -o addr | grep " + getIpAddress() + " | awk '{print $2}')/address", shell=True).decode('utf-8').replace(":", "")[:-1]
+        logging.info("MAC %s from bash", mac)
+
+    global entertainment_srv
+    entertainment_srv = None
+    file_platform_map = {
+        'arm64': 'entertainment-arm',
+        'amd64': 'entertainment-x86_64'
+    }
+
+    if not linux_compatible:
+        logging.warn('The Hue Entertainment API will not run on Windows without the Windows Subsystem for Linux (https://docs.microsoft.com/en-us/windows/wsl/install-win10)')
+    elif os.path.isfile('entertainment-srv'):
+        entertainment_srv = 'entertainment-srv'
+    elif platform.machine().lower() in file_platform_map:
+        entertainment_srv = file_platform_map[platform.machine().lower()]
+
+    
+    if entertainment_srv is None:
+        logging.warn('No entertainment executable found for platform %s. Available: %s', platform.machine().lower(), ["{0}: {1}".format(f, p) for p, f in file_platform_map.items()])
+        logging.warn('Hue Entertainment API will not be available.')
+    else:
+        logging.info('Using %s for Entertainment API', entertainment_srv)
+
+    ip = getIpAddress()
+    ip_components = ip.split(".")
+    bridge_config["config"]["ipaddress"] = ip
+    bridge_config["config"]["gateway"] = ip_components[0] + "." +  ip_components[1] + "." + ip_components[2] + ".1"
+    bridge_config["config"]["mac"] = mac[0] + mac[1] + ":" + mac[2] + mac[3] + ":" + mac[4] + mac[5] + ":" + mac[6] + mac[7] + ":" + mac[8] + mac[9] + ":" + mac[10] + mac[11]
+    bridge_config["config"]["bridgeid"] = (mac[:6] + 'FFFE' + mac[6:]).upper()
 
 def getIpAddress():
     if len(sys.argv) == 3:
@@ -42,21 +110,26 @@ def getIpAddress():
     s.connect(("8.8.8.8", 80))
     return s.getsockname()[0]
 
+def xplat_check_output(*args, **kwargs):
+    cmd = args[0]
+
+    if (platform.system() == 'Windows'):
+        cmd = [cmd[0:cmd.index(' ')], cmd[1+cmd.index(' '):]] if isinstance(cmd, str) else cmd
+        cmd = ["wsl", *cmd]
+
+    return check_output(cmd, *args[1:], **kwargs)
+
+def xplat_Popen(*args, **kwargs):
+    cmd = args[0]
+
+    if (platform.system() == 'Windows'):
+        cmd = [cmd[0:cmd.index(' ')], cmd[1+cmd.index(' '):]] if isinstance(cmd, str) else cmd
+        cmd = ["wsl", *cmd]
+
+    return Popen(cmd, *args[1:], **kwargs)
+
 def pretty_json(data):
-    return json.dumps(data, sort_keys=True,                  indent=4, separators=(',', ': '))
-
-if len(sys.argv) == 3:
-    mac = str(sys.argv[1]).replace(":","")
-else:
-    mac = check_output("cat /sys/class/net/$(ip -o addr | grep " + getIpAddress() + " | awk '{print $2}')/address", shell=True).decode('utf-8').replace(":","")[:-1]
-logging.debug(mac)
-
-run_service = True
-
-bridge_config = defaultdict(lambda:defaultdict(str))
-new_lights = {}
-sensors_state = {}
-
+    return json.dumps(data, sort_keys=True, indent=4, separators=(',', ': '))
 
 def updateConfig():
     for sensor in bridge_config["deconz"]["sensors"].keys():
@@ -76,7 +149,7 @@ def entertainmentService():
     fremeID = 0
     lightStatus = {}
     while True:
-        data = serverSocket.recvfrom(106)[0]
+        data = serverSocket.recvfrom(200)[0]
         nativeLights = {}
         if data[:9].decode('utf-8') == "HueStream":
             if data[14] == 0: #rgb colorspace
@@ -116,7 +189,7 @@ def entertainmentService():
 
                                         if (r, g, b) != lightStatus[lightId]["rgb"]:
                                             bri = int((r + b + g) / 3)
-                                            if abs(bri - lightStatus[lightId]["bri"]) >= 3:
+                                            if abs(bri - lightStatus[lightId]["bri"]) > 0:
                                                 patch.update({"bri": bri, "transitiontime": 3})
                                                 lightStatus[lightId]["bri"] = bri
 
@@ -243,16 +316,6 @@ def sendEmail(triggered_sensor):
     except:
         logging.exception("failed to send mail")
         return False
-#load config files
-try:
-    with open(cwd +'/config.json', 'r') as fp:
-        bridge_config = json.load(fp)
-        logging.debug("Config loaded")
-except Exception:
-    logging.exception("CRITICAL! Config file was not loaded")
-    sys.exit(1)
-
-
 
 def loadConfig():  #load and configure alarm virtual light
     if bridge_config["alarm_config"]["mail_username"] != "":
@@ -266,13 +329,12 @@ def loadConfig():  #load and configure alarm virtual light
                 bridge_config["alarm_config"]["virtual_light"] = new_light_id
             else:
                 logging.debug("Mail test failed")
-loadConfig()
 
-def saveConfig(filename='/opt/hue-emulator/config.json'):
+def saveConfig(filename='./config.json'):
     with open(cwd +'/config.json', 'w') as fp:
         json.dump(bridge_config, fp, sort_keys=True, indent=4, separators=(',', ': '))
     if docker:
-        Popen(["cp", "config.json", "export/"])
+        xplat_Popen(["cp", "config.json", "export/"])
 
 def generateSensorsState():
     for sensor in bridge_config["sensors"]:
@@ -281,15 +343,6 @@ def generateSensorsState():
             for key in bridge_config["sensors"][sensor]["state"].keys():
                 if key in ["lastupdated", "presence", "flag", "dark", "daylight", "status"]:
                     sensors_state[sensor]["state"].update({key: datetime.now()})
-
-generateSensorsState()
-
-ip_pices = getIpAddress().split(".")
-bridge_config["config"]["ipaddress"] = getIpAddress()
-bridge_config["config"]["gateway"] = ip_pices[0] + "." +  ip_pices[1] + "." + ip_pices[2] + ".1"
-bridge_config["config"]["mac"] = mac[0] + mac[1] + ":" + mac[2] + mac[3] + ":" + mac[4] + mac[5] + ":" + mac[6] + mac[7] + ":" + mac[8] + mac[9] + ":" + mac[10] + mac[11]
-bridge_config["config"]["bridgeid"] = (mac[:6] + 'FFFE' + mac[6:]).upper()
-
 
 def schedulerProcessor():
     while run_service:
@@ -641,7 +694,7 @@ def sendLightRequest(light, data):
             if bridge_config["lights_address"][light]["protocol"] == "ikea_tradfri":
                 if "5712" not in payload:
                     payload["5712"] = 4 #If no transition add one, might also add check to prevent large transitiontimes
-                    check_output("./coap-client-linux -m put -u \"" + bridge_config["lights_address"][light]["identity"] + "\" -k \"" + bridge_config["lights_address"][light]["preshared_key"] + "\" -e '{ \"3311\": [" + json.dumps(payload) + "] }' \"" + url + "\"", shell=True)
+                    xplat_check_output("./coap-client-linux -m put -u \"" + bridge_config["lights_address"][light]["identity"] + "\" -k \"" + bridge_config["lights_address"][light]["preshared_key"] + "\" -e '{ \"3311\": [" + json.dumps(payload) + "] }' \"" + url + "\"", shell=True)
             elif bridge_config["lights_address"][light]["protocol"] in ["hue", "deconz"]:
                 color = {}
                 if "xy" in payload:
@@ -689,8 +742,8 @@ def updateGroupStats(light): #set group stats based on lights status in that gro
 
 def scanForLights(): #scan for ESP8266 lights and strips
     Thread(target=yeelight.discover, args=[bridge_config, new_lights]).start()
-    #return all host that listen on port 80
-    device_ips = check_output("nmap  " + getIpAddress() + "/24 -p80 --open -n | grep report | cut -d ' ' -f5", shell=True).decode('utf-8').split("\n")
+    # all host that listen on port 80
+    device_ips = xplat_check_output("nmap  " + getIpAddress() + "/24 -p80 --open -n | grep report | cut -d ' ' -f5", shell=True).decode('utf-8').split("\n")
     logging.debug(pretty_json(device_ips))
     del device_ips[-1] #delete last empty element in list
     for ip in device_ips:
@@ -741,7 +794,7 @@ def syncWithLights(): #update Hue Bridge lights states
                     light_data = json.loads(sendRequest("http://" + bridge_config["lights_address"][light]["ip"] + "/api/" + bridge_config["lights_address"][light]["username"] + "/lights/" + bridge_config["lights_address"][light]["light_id"], "GET", "{}"))
                     bridge_config["lights"][light]["state"].update(light_data["state"])
                 elif bridge_config["lights_address"][light]["protocol"] == "ikea_tradfri":
-                    light_data = json.loads(check_output("./coap-client-linux -m get -u \"" + bridge_config["lights_address"][light]["identity"] + "\" -k \"" + bridge_config["lights_address"][light]["preshared_key"] + "\" \"coaps://" + bridge_config["lights_address"][light]["ip"] + ":5684/15001/" + str(bridge_config["lights_address"][light]["device_id"]) +"\"", shell=True).decode('utf-8').split("\n")[3])
+                    light_data = json.loads(xplat_check_output("./coap-client-linux -m get -u \"" + bridge_config["lights_address"][light]["identity"] + "\" -k \"" + bridge_config["lights_address"][light]["preshared_key"] + "\" \"coaps://" + bridge_config["lights_address"][light]["ip"] + ":5684/15001/" + str(bridge_config["lights_address"][light]["device_id"]) +"\"", shell=True).decode('utf-8').split("\n")[3])
                     bridge_config["lights"][light]["state"]["on"] = bool(light_data["3311"][0]["5850"])
                     bridge_config["lights"][light]["state"]["bri"] = light_data["3311"][0]["5851"]
                     if "5706" in light_data["3311"][0]:
@@ -827,11 +880,11 @@ def motionDetected(sensor):
 
 def scanTradfri():
     if "tradfri" in bridge_config:
-        tradri_devices = json.loads(check_output("./coap-client-linux -m get -u \"" + bridge_config["tradfri"]["identity"] + "\" -k \"" + bridge_config["tradfri"]["psk"] + "\" \"coaps://" + bridge_config["tradfri"]["ip"] + ":5684/15001\"", shell=True).decode('utf-8').split("\n")[3])
+        tradri_devices = json.loads(xplat_check_output("./coap-client-linux -m get -u \"" + bridge_config["tradfri"]["identity"] + "\" -k \"" + bridge_config["tradfri"]["psk"] + "\" \"coaps://" + bridge_config["tradfri"]["ip"] + ":5684/15001\"", shell=True).decode('utf-8').split("\n")[3])
         logging.debug(pretty_json(tradri_devices))
         lights_found = 0
         for device in tradri_devices:
-            device_parameters = json.loads(check_output("./coap-client-linux -m get -u \"" + bridge_config["tradfri"]["identity"] + "\" -k \"" + bridge_config["tradfri"]["psk"] + "\" \"coaps://" + bridge_config["tradfri"]["ip"] + ":5684/15001/" + str(device) +"\"", shell=True).decode('utf-8').split("\n")[3])
+            device_parameters = json.loads(xplat_check_output("./coap-client-linux -m get -u \"" + bridge_config["tradfri"]["identity"] + "\" -k \"" + bridge_config["tradfri"]["psk"] + "\" \"coaps://" + bridge_config["tradfri"]["ip"] + ":5684/15001/" + str(device) +"\"", shell=True).decode('utf-8').split("\n")[3])
             if "3311" in device_parameters:
                 new_light = True
                 for light in bridge_config["lights_address"]:
@@ -840,7 +893,7 @@ def scanTradfri():
                         break
                 if new_light:
                     lights_found += 1
-                    #register new tradfri lightdevice_id
+                    # register new tradfri lightdevice_id
                     logging.debug("register tradfi light " + device_parameters["9001"])
                     new_light_id = nextFreeId(bridge_config, "lights")
                     bridge_config["lights"][new_light_id] = {"state": {"on": False, "bri": 200, "hue": 0, "sat": 0, "xy": [0.0, 0.0], "ct": 461, "alert": "none", "effect": "none", "colormode": "ct", "reachable": True}, "type": "Extended color light", "name": device_parameters["9001"], "uniqueid": "1234567" + str(device), "modelid": "LLM010", "swversion": "66009461"}
@@ -868,15 +921,15 @@ def websocketClient():
                     bridge_sensor_id = bridge_config["deconz"]["sensors"][message["id"]]["bridgeid"]
                     if "state" in message and bridge_config["sensors"][bridge_sensor_id]["config"]["on"]:
 
-                        #change codes for emulated hue Switches
+                        # change codes for emulated hue Switches
                         if "hueType" in bridge_config["deconz"]["sensors"][message["id"]]:
                             rewriteDict = {"ZGPSwitch": {1002: 34, 3002: 16, 4002: 17, 5002: 18}, "ZLLSwitch" : {1002 : 1000, 2002: 2000, 2001: 2001, 2003: 2002, 3001: 3001, 3002: 3000, 3003: 3002, 4002: 4000, 5002: 4000} }
                             message["state"]["buttonevent"] = rewriteDict[bridge_config["deconz"]["sensors"][message["id"]]["hueType"]][message["state"]["buttonevent"]]
-                        #end change codes for emulated hue Switches
+                        # end change codes for emulated hue Switches
 
-                        #convert tradfri motion sensor notification to look like Hue Motion Sensor
+                        # convert tradfri motion sensor notification to look like Hue Motion Sensor
                         if message["state"] and bridge_config["deconz"]["sensors"][message["id"]]["modelid"] == "TRADFRI motion sensor":
-                            #find the light sensor id
+                            # find the light sensor id
                             light_sensor = "0"
                             for sensor in bridge_config["sensors"].keys():
                                 if bridge_config["sensors"][sensor]["type"] == "ZLLLightLevel" and bridge_config["sensors"][sensor]["uniqueid"] == bridge_config["sensors"][bridge_sensor_id]["uniqueid"][:-1] + "0":
@@ -895,7 +948,7 @@ def websocketClient():
                             bridge_config["sensors"][light_sensor]["state"]["daylight"] = not message["state"]["dark"]
                             bridge_config["sensors"][light_sensor]["state"]["lastupdated"] = message["state"]["lastupdated"]
 
-                        #Xiaomi motion w/o light level sensor
+                        # Xiaomi motion w/o light level sensor
                         if message["state"] and bridge_config["deconz"]["sensors"][message["id"]]["modelid"] == "lumi.sensor_motion":
                             for sensor in bridge_config["sensors"].keys():
                                 if bridge_config["sensors"][sensor]["type"] == "ZLLLightLevel" and bridge_config["sensors"][sensor]["uniqueid"] == bridge_config["sensors"][bridge_sensor_id]["uniqueid"][:-1] + "0":
@@ -909,7 +962,7 @@ def websocketClient():
                                 bridge_config["sensors"][light_sensor]["state"]["lightlevel"] = 6000
                                 bridge_config["sensors"][light_sensor]["state"]["dark"] = True
 
-                        #convert xiaomi motion sensor to hue sensor
+                        # convert xiaomi motion sensor to hue sensor
                         if message["state"] and bridge_config["deconz"]["sensors"][message["id"]]["modelid"] == "lumi.sensor_motion.aq2" and message["state"] and bridge_config["deconz"]["sensors"][message["id"]]["type"] == "ZHALightLevel":
                             bridge_config["sensors"][bridge_sensor_id]["state"].update(message["state"])
                             return
@@ -958,7 +1011,7 @@ def scanDeconz():
         deconz_config = json.loads(sendRequest("http://127.0.0.1:" + str(bridge_config["deconz"]["port"]) + "/api/" + bridge_config["deconz"]["username"] + "/config", "GET", "{}"))
         bridge_config["deconz"]["websocketport"] = deconz_config["websocketport"]
 
-        #lights
+        # lights
         deconz_lights = json.loads(sendRequest("http://127.0.0.1:" + str(bridge_config["deconz"]["port"]) + "/api/" + bridge_config["deconz"]["username"] + "/lights", "GET", "{}"))
         for light in deconz_lights:
             if light not in bridge_config["deconz"]["lights"]:
@@ -973,7 +1026,7 @@ def scanDeconz():
 
 
 
-        #sensors
+        # sensors
         deconz_sensors = json.loads(sendRequest("http://127.0.0.1:" + str(bridge_config["deconz"]["port"]) + "/api/" + bridge_config["deconz"]["username"] + "/sensors", "GET", "{}"))
         for sensor in deconz_sensors:
             if sensor not in bridge_config["deconz"]["sensors"]:
@@ -1017,7 +1070,7 @@ def scanDeconz():
 
 
 def updateAllLights():
-    ## apply last state on startup to all bulbs, usefull if there was a power outage
+    # apply last state on startup to all bulbs, usefull if there was a power outage
     for light in bridge_config["lights_address"]:
         payload = {}
         payload["on"] = bridge_config["lights"][light]["state"]["on"]
@@ -1146,7 +1199,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        #Some older Philips Tv's sent non-standard HTTP GET requests with a Content-Lenght and a
+        # Some older Philips Tv's sent non-standard HTTP GET requests with a Content-Lenght and a
         # body. The HTTP body needs to be consumed and ignored in order to request be handle correctly.
         self.read_http_request_body()
 
@@ -1160,7 +1213,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
             self._set_end_headers(f.read())
         elif self.path == '/config.js':
             self._set_headers()
-            #create a new user key in case none is available
+            # create a new user key in case none is available
             if len(bridge_config["config"]["whitelist"]) == 0:
                 bridge_config["config"]["whitelist"]["web-ui-" + str(random.randrange(0, 99999))] = {"create date": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),"last use date": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),"name": "WegGui User"}
             self._set_end_headers(bytes('window.config = { API_KEY: "' + list(bridge_config["config"]["whitelist"])[0] + '",};', "utf8"))
@@ -1174,14 +1227,14 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
         elif self.path == '/save':
             self._set_headers()
             saveConfig()
-            self._set_end_headers(bytes(json.dumps([{"success":{"configuration":"saved","filename":"/opt/hue-emulator/config.json"}}] ,separators=(',', ':')), "utf8"))
+            self._set_end_headers(bytes(json.dumps([{"success":{"configuration":"saved","filename":"./config.json"}}] ,separators=(',', ':')), "utf8"))
         elif self.path.startswith("/tradfri"): #setup Tradfri gateway
             self._set_headers()
             get_parameters = parse_qs(urlparse(self.path).query)
             if "code" in get_parameters:
-                #register new identity
+                # register new identity
                 new_identity = "Hue-Emulator-" + str(random.randrange(0, 999))
-                registration = json.loads(check_output("./coap-client-linux -m post -u \"Client_identity\" -k \"" + get_parameters["code"][0] + "\" -e '{\"9090\":\"" + new_identity + "\"}' \"coaps://" + get_parameters["ip"][0] + ":5684/15011/9063\"", shell=True).decode('utf-8').split("\n")[3])
+                registration = json.loads(xplat_check_output("./coap-client-linux -m post -u \"Client_identity\" -k \"" + get_parameters["code"][0] + "\" -e '{\"9090\":\"" + new_identity + "\"}' \"coaps://" + get_parameters["ip"][0] + ":5684/15011/9063\"", shell=True).decode('utf-8').split("\n")[3])
                 bridge_config["tradfri"] = {"psk": registration["9091"], "ip": get_parameters["ip"][0], "identity": new_identity}
                 lights_found = scanTradfri()
                 if lights_found == 0:
@@ -1194,7 +1247,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
             self._set_headers()
             get_parameters = parse_qs(urlparse(self.path).query)
             if "device_id" in get_parameters:
-                #register new mi-light
+                # register new mi-light
                 new_light_id = nextFreeId(bridge_config, "lights")
                 bridge_config["lights"][new_light_id] = {"state": {"on": False, "bri": 200, "hue": 0, "sat": 0, "xy": [0.0, 0.0], "ct": 461, "alert": "none", "effect": "none", "colormode": "ct", "reachable": True}, "type": "Extended color light", "name": "MiLight " + get_parameters["mode"][0] + " " + get_parameters["device_id"][0], "uniqueid": "1a2b3c4" + str(random.randrange(0, 99)), "modelid": "LCT001", "swversion": "66009461"}
                 new_lights.update({new_light_id: {"name": "MiLight " + get_parameters["mode"][0] + " " + get_parameters["device_id"][0]}})
@@ -1258,7 +1311,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/deconz"): #setup imported deconz sensors
             self._set_headers()
             get_parameters = parse_qs(urlparse(self.path).query)
-            #clean all rules related to deconz Switches
+            # clean all rules related to deconz Switches
             if get_parameters:
                 emulator_resourcelinkes = []
                 for resourcelink in bridge_config["resourcelinks"].keys(): # delete all previews rules of IKEA remotes
@@ -1294,7 +1347,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                                 addTradfriDimmer(key, get_parameters[key][0])
                             elif bridge_config["deconz"]["sensors"][key]["modelid"] == "TRADFRI motion sensor":
                                 bridge_config["deconz"]["sensors"][key]["lightsensor"] = get_parameters[key][0]
-                            #store room id in deconz sensors
+                            # store room id in deconz sensors
                             for sensor in bridge_config["deconz"]["sensors"].keys():
                                 if bridge_config["deconz"]["sensors"][sensor]["bridgeid"] == key:
                                     bridge_config["deconz"]["sensors"][sensor]["room"] = get_parameters[key][0]
@@ -1346,16 +1399,16 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                                 bridge_config["sensors"][sensor]["state"]["lightlevel"] = 6000
                                 bridge_config["sensors"][sensor]["state"]["dark"] = True
 
-                            #if alarm is activ trigger the alarm
+                            # if alarm is activ trigger the alarm
                             if "virtual_light" in bridge_config["alarm_config"] and bridge_config["lights"][bridge_config["alarm_config"]["virtual_light"]]["state"]["on"] and bridge_config["sensors"][sensor]["state"]["presence"] == True:
                                 sendEmail(bridge_config["sensors"][sensor]["name"])
-                                #triger_horn() need development
+                                # triger_horn() need development
                         rulesProcessor(sensor, current_time) #process the rules to perform the action configured by application
             self._set_end_headers(bytes("done", "utf8"))
         else:
             url_pices = self.path.split('/')
             if len(url_pices) < 3:
-                #self._set_headers_error()
+                # self._set_headers_error()
                 self.send_error(404, 'not found')
                 return
             else:
@@ -1419,7 +1472,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
         if len(url_pices) == 4: #data was posted to a location
             if url_pices[2] in bridge_config["config"]["whitelist"]:
                 if ((url_pices[3] == "lights" or url_pices[3] == "sensors") and not bool(post_dictionary)):
-                    #if was a request to scan for lights of sensors
+                    # if was a request to scan for lights of sensors
                     Thread(target=scanForLights).start()
                     sleep(7) #give no more than 5 seconds for light scanning (otherwise will face app disconnection timeout)
                     self._set_end_headers(bytes(json.dumps([{"success": {"/" + url_pices[3]: "Searching for new devices"}}],separators=(',', ':')), "utf8"))
@@ -1517,12 +1570,27 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                 elif url_pices[3] == "groups" and "stream" in put_dictionary:
                     if "active" in put_dictionary["stream"]:
                         if put_dictionary["stream"]["active"]:
-                            logging.debug("start hue entertainment")
-                            Popen(["/opt/hue-emulator/entertainment-srv", "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
-                            sleep(0.2)
-                            bridge_config["groups"][url_pices[4]]["stream"].update({"active": True, "owner": url_pices[2], "proxymode": "auto", "proxynode": "/bridge"})
+                            if linux_compatible:
+                                if entertainment_srv is not None:
+                                    logging.debug("start hue entertainment")
+                                    try:
+                                        xplat_Popen(["killall", entertainment_srv]).wait(1)
+                                    except subprocess.TimeoutException:
+                                        pass
+                                    xplat_Popen(['./{0}'.format(entertainment_srv), "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
+                                    sleep(0.2)
+                                    bridge_config["groups"][url_pices[4]]["stream"].update({"active": True, "owner": url_pices[2], "proxymode": "auto", "proxynode": "/bridge"})
+                                else:
+                                    logging.warn("Could not Hue Entertainment server: no binary found")
+                            else:
+                                logging.warn("Could not start Hue Entertainment server: system must be capable of running Linux binaries")
                         else:
-                            Popen(["killall", "entertainment-srv"])
+                            if linux_compatible:
+                                try:
+                                    xplat_Popen(["killall", entertainment_srv]).wait(1)
+                                except subprocess.TimeoutException:
+                                    pass
+
                             bridge_config["groups"][url_pices[4]]["stream"].update({"active": False, "owner": None})
                     else:
                         bridge_config[url_pices[3]][url_pices[4]].update(put_dictionary)
@@ -1534,12 +1602,27 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                     if url_pices[5] == "stream":
                         if "active" in put_dictionary:
                             if put_dictionary["active"]:
-                                logging.debug("start hue entertainment")
-                                Popen(["/opt/hue-emulator/entertainment-srv", "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
-                                sleep(0.2)
-                                bridge_config["groups"][url_pices[4]]["stream"].update({"active": True, "owner": url_pices[2], "proxymode": "auto", "proxynode": "/bridge"})
+                                if linux_compatible:
+                                    if entertainment_srv is not None:
+                                        logging.debug("start hue entertainment")
+                                        try:
+                                            xplat_Popen(["killall", entertainment_srv]).wait(1)
+                                        except subprocess.TimeoutException:
+                                            pass
+                                        xplat_Popen(['./{0}'.format(entertainment_srv), "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
+                                        sleep(0.2)
+                                        bridge_config["groups"][url_pices[4]]["stream"].update({"active": True, "owner": url_pices[2], "proxymode": "auto", "proxynode": "/bridge"})
+                                    else:
+                                        logging.warn("Could not Hue Entertainment server: no binary found")
+                                else:
+                                    logging.warn("Could not start Hue Entertainment server: system must be capable of running Linux binaries")
                             else:
-                                Popen(["killall", "entertainment-srv"])
+                                if linux_compatible:
+                                    try:
+                                        xplat_Popen(["killall", entertainment_srv]).wait(1)
+                                    except subprocess.TimeoutException:
+                                        pass
+
                                 bridge_config["groups"][url_pices[4]]["stream"].update({"active": False, "owner": None})
                     elif "scene" in put_dictionary: #scene applied to group
                         for light in bridge_config["scenes"][put_dictionary["scene"]]["lights"]:
@@ -1597,7 +1680,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                             bridge_config["lights"][light]["state"].update(put_dictionary)
                             Thread(target=sendLightRequest, args=[light, put_dictionary]).start()
                 elif url_pices[3] == "lights": #state is applied to a light
-                #jb
+                # jb
                     for key, value in put_dictionary.items():
                         if key in ["ct", "xy"]: #colormode must be set by bridge
                             bridge_config["lights"][url_pices[4]]["state"]["colormode"] = key
@@ -1678,7 +1761,7 @@ def run(https, server_class=ThreadingSimpleServer, handler_class=HueEmulatorRequ
         ctx.options |= ssl.OP_CIPHER_SERVER_PREFERENCE
         ctx.set_ciphers('ECDHE-ECDSA-AES128-GCM-SHA256')
         ctx.set_ecdh_curve('prime256v1')
-        #ctx.set_alpn_protocols(['h2', 'http/1.1'])
+        # ctx.set_alpn_protocols(['h2', 'http/1.1'])
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         logging.debug('Starting ssl httpd...')
     else:
@@ -1689,6 +1772,27 @@ def run(https, server_class=ThreadingSimpleServer, handler_class=HueEmulatorRequ
     httpd.server_close()
 
 if __name__ == "__main__":
+    if debug:
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG)
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch.setFormatter(formatter)
+        root.addHandler(ch)
+        
+    # load config files
+    try:
+        with open(cwd +'/config.json', 'r') as fp:
+            bridge_config = json.load(fp)
+            logging.debug("Config loaded")
+    except Exception:
+        logging.exception("CRITICAL! Config file was not loaded")
+        sys.exit(1)
+    loadConfig()
+    generateSensorsState()
+    checkEnvironment()
+    setServerConfig()
     updateConfig()
     if bridge_config["deconz"]["enabled"]:
         scanDeconz()
