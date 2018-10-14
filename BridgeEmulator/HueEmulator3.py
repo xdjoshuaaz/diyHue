@@ -165,6 +165,7 @@ def entertainmentService():
                                 lightStatus[lightId] = {"on": False, "bri": 1, "xy": [-999, -999], "rgb": (-1, -1, -1)}
 
                             bri = max(r, g, b)
+                            yeelight = bridge_config["lights_address"][str(lightId)]["protocol"] == "yeelight"
 
                             if r == 0 and  g == 0 and  b == 0:
                                 bridge_config["lights"][str(lightId)]["state"]["on"] = False
@@ -175,20 +176,19 @@ def entertainmentService():
                                     nativeLights[bridge_config["lights_address"][str(lightId)]["ip"]] = {}
                                 nativeLights[bridge_config["lights_address"][str(lightId)]["ip"]][bridge_config["lights_address"][str(lightId)]["light_nr"] - 1] = [r, g, b]
                             else:
-                                yeelight = bridge_config["lights_address"][str(lightId)]["protocol"] == "yeelight"
                                 if yeelight or fremeID == 24:  # => every seconds, increase in case the destination device is overloaded
                                     patch = {}
+                                    
                                     if r == 0 and  g == 0 and  b == 0:
                                         if lightStatus[lightId]["on"]:
-                                            patch.update({"on": False, "transitiontime": 3})
-                                            lightStatus[lightId]["on"] = False
+                                            if not yeelight:
+                                                patch.update({"on": False, "transitiontime": 3})
+                                                lightStatus[lightId]["on"] = False
                                     elif lightStatus[lightId]["on"] == False:
                                         patch.update({"on": True, "transitiontime": 3})
                                         lightStatus[lightId]["on"] = True
 
                                     if lightStatus[lightId]["on"]:
-                                        xy = convert_rgb_xy(r, g, b)
-
                                         if (r, g, b) != lightStatus[lightId]["rgb"]:
                                             if abs(bri - lightStatus[lightId]["bri"]) > 0:
                                                 patch.update({"bri": bri, "transitiontime": 3})
@@ -1134,6 +1134,8 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
     def __init__(self, request, client_address, server):
         client_ip = client_address[0]
 
+        self.request_handler_delegate = None
+
         for light_id in bridge_config["lights_address"]:
             light = bridge_config["lights_address"][light_id]
 
@@ -1145,22 +1147,25 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
 
                 for protocol in protocols:
                     if "protocols." + protocol_name == protocol.__name__:
-                        self.light_protocol = protocol
+                        self.request_handler_delegate = self.invoke_optional_method(protocol, "RequestHandlerDelegateClass", protocol, self, default=None)
                         break
                 break
 
         super().__init__(request, client_address, server)
 
     def setup(self):
-        if not self.invoke_light_protocol_method('setup_request', self):
+        handled = self.invoke_optional_method(self.request_handler_delegate, "setup")
+        if not handled:
             super().setup()
 
     def handle(self):
-        if not self.invoke_light_protocol_method('handle_request', self):
+        handled = self.invoke_optional_method(self.request_handler_delegate, "handle")
+        if not handled:
             super().handle()
 
-    def finish(self, force=False):
-        if not self.invoke_light_protocol_method('finish_request', self):
+    def finish(self):
+        handled = self.invoke_optional_method(self.request_handler_delegate, "finish")
+        if not handled:
             super().finish()
 
     def parse_request(self):
@@ -1170,10 +1175,10 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
         
         return result
 
-    def invoke_light_protocol_method(self, method_name, *args, **kwargs):
-        if self.light_protocol is not None:
+    def invoke_optional_method(self, target, method_name, *args, **kwargs):
+        if target is not None:
             try:
-                method = getattr(self.light_protocol, method_name)
+                method = getattr(target, method_name)
                 return method(*args)
             except AttributeError:
                 pass
@@ -1578,7 +1583,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                                     logging.debug("start hue entertainment")
                                     try:
                                         xplat_Popen(["killall", entertainment_srv]).wait(1)
-                                    except subprocess.TimeoutException:
+                                    except subprocess.TimeoutExpired:
                                         pass
                                     xplat_Popen(['./{0}'.format(entertainment_srv), "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
                                     sleep(0.2)
@@ -1591,7 +1596,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                             if linux_compatible:
                                 try:
                                     xplat_Popen(["killall", entertainment_srv]).wait(1)
-                                except subprocess.TimeoutException:
+                                except subprocess.TimeoutExpired:
                                     pass
 
                             bridge_config["groups"][url_pices[4]]["stream"].update({"active": False, "owner": None})
@@ -1610,7 +1615,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                                         logging.debug("start hue entertainment")
                                         try:
                                             xplat_Popen(["killall", entertainment_srv]).wait(1)
-                                        except subprocess.TimeoutException:
+                                        except subprocess.TimeoutExpired:
                                             pass
                                         xplat_Popen(['./{0}'.format(entertainment_srv), "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
                                         sleep(0.2)
@@ -1623,7 +1628,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                                 if linux_compatible:
                                     try:
                                         xplat_Popen(["killall", entertainment_srv]).wait(1)
-                                    except subprocess.TimeoutException:
+                                    except subprocess.TimeoutExpired:
                                         pass
 
                                 bridge_config["groups"][url_pices[4]]["stream"].update({"active": False, "owner": None})

@@ -9,30 +9,351 @@ from threading import Thread, current_thread
 from functools import partial
 from collections import namedtuple
 import asyncio
-
+import threading
+import socketserver
 from functions import light_types, nextFreeId
 from functions.colors import convert_rgb_xy, convert_xy
 from HueEmulator3 import getIpAddress
+from .base import Protocol
 
 # Minimum time between commands in socket mode
 MINIMUM_MSEC_BETWEEN_COMMANDS = 300
 # Minimum time between commands in music mode
-MINIMUM_MSEC_BETWEEN_COMMANDS_MUSIC = 15
+MINIMUM_MSEC_BETWEEN_COMMANDS_MUSIC = 30
 
-# Combine rgb + brightness commands: off (0), set_scene (1), start_flow (2, 50ms)
+# Combine rgb + brightness commands: off (0), set_scene (1), start_flow (2, 50ms OR RAPID_SMOOTH_TRANSITION_TIME)
 COMBI_COMMANDS = 0
 # If true, use smooth transition instead of sudden when receiving rapid requests (from Hue Entertainment)
-RAPID_SMOOTH = False
+RAPID_SMOOTH = True
 # If RAPID_SMOOTH is True, what should the smooth transition time be? Set to None to keep value from data
-RAPID_SMOOTH_TRANSITION_TIME = 50
+RAPID_SMOOTH_TRANSITION_TIME = 30
 
-music_mode_connections = {}
-socket_connections = {}
-socket_connection_attempts = {}
-queued_set_light_data = {}
+# region Future factory
 
-event_loop = asyncio.new_event_loop()
-Thread(name="yeelight-command-queue", target=event_loop.run_forever).start()
+
+class FutureFactory:
+    """
+    Factory that creates future objects for completion by implementors of this class.
+
+    Attributes
+    ----------
+    persist_after_result : bool
+        Determines whether a future remains in the factory after its value is resolved. Useful for futures representing persistent objects such as connections. Default: True
+
+    persist_after_exception : bool
+        Determines whether a future remains in the factory after it resolves to an exception. Default: False
+
+    """
+
+    def __init__(self, key_selector):
+        """
+        Constructor.
+
+        Parameters
+        ----------
+        key_selector : lambda
+            A lambda function taking in an instance, and return a unique key (e.g. an ID)
+
+        """
+        self.key_selector = key_selector
+        self.futures = {}
+        self.future_timeouts = {}
+        self.persist_after_result = False
+        self.persist_after_exception = False
+
+    def get_or_build(self, key, *args, **kwargs):
+        """
+        Retrieve an existing future keyed by *key*, or builds a new one.
+
+        Parameters
+        ----------
+        key
+            The key to fetch an existing instance for, or to build a new instance
+
+        args
+            Arguments that will be passed to the build method
+
+        kwargs
+            Keyword arguments that will be passed to the build method
+        """
+        future = self.get(key)
+        if future is not None
+            return future
+
+        logging.info("%s creating new instance called %s",
+                     self.__class__.__name__, key)
+
+        future = futures.Future()
+        future.set_running_or_notify_cancel()
+        future.add_done_callback(
+            lambda f: self.future_done_callback(f, key, *args, **kwargs))
+        self.futures[key] = future
+
+        try:
+            instance = self.build(key, future, *args, **kwargs)
+            if instance is not None:
+                future.set_result(instance)
+        except Exception as ex:
+            future.set_exception(ex)
+
+        return future
+
+    def get(self, key):
+        """
+        Retrieve an existing future keyed by *key".
+
+        Parameters
+        ----------
+        key
+            The key to fetch an existing instance for.
+        """
+
+        if key in self.futures:
+            return self.futures[key]
+
+        return None
+
+    def build(self, key, future, *args, **kwargs):
+        """
+        Build method which is called when a new instance needs to built.
+        Implemented by subclasses.
+
+        Parameters
+        ----------
+        key
+            The key that the built instance represents
+
+        future : Future
+            The future that will need to completed to "finish" the build and therefore the future, using set_result or set_exception
+
+        args
+            Arguments passed by get_or_create
+
+        kwargs
+            Keyword arguments passed by get_or_create
+
+        Returns
+        -------
+        None, or an instance
+            Returning anything other than None will complete the future automatically.
+
+        Raises
+        ------
+        Exception
+            Raising an exception will set the future's exception automatically.
+        """
+        return None
+
+    def future_done_callback(self, future, key, dispose=True, *args, **kwargs):
+        """
+        Called when a future is completed or has raised an exception.
+        Cleans up the futures dictionary and cancels timeout timers.
+
+        Parameters
+        ----------
+        future : Future
+            Future that has returned a result or an exception
+
+        key
+            Key for the future
+
+        dispose : bool
+            If True, the future will be removed from the factory according to persist_after_result and persist_after_exception attributes.
+
+        args
+            Arguments passed by get_or_create
+
+        kwargs
+            Keyword arguments passed by get_or_create
+        """
+        try:
+            instance = future.result()
+
+            if not self.persist_after_result and dispose:
+                if key is None:
+                    key = self.key_selector(instance)
+
+                self.instance_disposed(
+                    instance=instance, key=id, future=future)
+        except Exception as ex:
+            if not self.persist_after_exception and dispose:
+                self.instance_disposed(key=key, future=future)
+        finally:
+            self.future_timeout_cleanup(future)
+
+    def instance_disposed(self, instance=None, key=None, future=None):
+        """
+        Removes a key from the factory's list of futures.
+
+        Parameters
+        ----------
+        instance
+            If specified, this method will only remove futures from the factory if the future's result matches the passed instance.
+
+        key
+            If not specified, this method will use the factory's key_selector to determine the key - the instance parameter is required in this case.
+
+        future : Future
+            If specified, this method will only remove futures from the factory if the future matches the passed future.
+        """
+        if key is None and instance is None:
+            raise Exception("key and instance is None")
+
+        if key is None:
+            key = self.key_selector(instance)
+
+        if key is None:
+            raise Exception("Could not find instance")
+
+        if key in self.futures:
+            if future is None or self.futures[key] is future:
+                if instance is None or (not self.futures[key].running() and not self.futures[key].cancelled() and not self.futures[key].exception() and self.futures[key].result() == instance):
+                    found_future = self.futures[key]
+                    del self.futures[key]
+
+                    self.future_timeout_cleanup(found_future)
+
+    def future_timeout_cleanup(self, future):
+        """
+        Cancels timeouts for a given future.
+
+        Parameters
+        ----------
+        future : Future
+            Future to cancel timeouts for
+        """
+        if future in self.future_timeouts:
+            self.future_timeouts[future].cancel()
+            del self.future_timeouts[future]
+
+    def future_timeout(self, future, seconds):
+        """
+        Starts a timeout for a future. After *seconds*, the future will have its exception set to a TimeoutError if it hasn't already been populated.
+
+        Parameters
+        ----------
+        future : Future
+            Future to start a timeout for
+
+        seconds : int
+            Number of seconds from now until the future is considered "timed out"
+        """
+        if future in self.future_timeouts:
+            self.future_timeouts[future].cancel()
+
+        self.future_timeouts[future] = threading.Timer(
+            seconds, lambda:
+            self.future_timedout(future))
+        self.future_timeouts[future].start()
+
+    def future_timedout(self, future):
+        """
+        Called when a timeout started by future_timeout has finished.
+
+        Parameters
+        ----------
+        future : Future
+            Future to set an exception for
+        """
+        if not future.done():
+            future.set_exception(TimeoutError())
+
+        self.future_timeout_cleanup(future)
+# endregion
+
+# region Connection factory (handles both types of connection)
+
+
+class YeelightConnectionFactory():
+    """
+    Factory that creates new connections and re-uses existing open connections where possible.
+    """
+
+    def __init__(self, sockets, music_sockets):
+        """
+        Constructor.
+
+        Parameters
+        ----------
+        sockets : SocketConnectionFactory
+            A SocketConnectionFactory instance
+        music_socket : MusicModeSocketConnectionFactory
+            A MusicModeSocketConnectionFactory instance
+        """
+        self.sockets = sockets
+        self.music_sockets = music_sockets
+
+    def get_or_build(self, ip, music=True, timeout=5):
+        """
+        Retrieve an existing connection to *ip*, or builds a new one.
+
+        Parameters
+        ----------
+        ip : str
+            IP address to retrieve a connection for
+        music : bool
+            Determines if a music mode connection is suitable
+        timeout : int
+            Seconds before timing out when creating a new connection
+        """
+        existing_socket = self.get(ip, music=music)
+
+        if existing_socket is not None:
+            return existing_socket
+
+        socket = self.sockets.get_or_build(ip, timeout=timeout)
+        return socket
+
+    def get(self, ip, music=True):
+        if music:
+            music_socket_future = self.music_sockets.get(ip)
+            if music_socket_future is not None and music_socket_future.done():
+                return music_socket_future
+
+        socket_future = self.sockets.get(ip)
+        if socket_future is not None:
+            return socket_future
+# endregion
+
+# region Command factory (using Futures)
+
+
+class CommandFactory(FutureFactory):
+    def __init__(self, connection):
+        super().__init__(lambda c: c["id"])
+        self.connection = connection
+        self.connection.response_subscribers.append(
+            lambda d: self.receive_command_response(d))
+        self.connection.disposed_subscribers.append(
+            lambda: self.connection_disposed())
+
+    def get_or_build(self, id, method_name, *params, timeout=5, **kwargs):
+        return super().get_or_build(id, method_name, *params, **({"timeout": timeout}))
+
+    def build(self, id, future, method_name, *params, **kwargs):
+        timeout = kwargs.get('timeout', 5)
+        logging.debug("%s: Invoking command id %d, method %s, params %s",
+                      self.connection._id, id, method_name, json.dumps(params))
+
+        self.connection.send((json.dumps(
+            {"id": id, "method": method_name, "params": params}) + "\r\n").encode())
+
+        if timeout:
+            self.future_timeout(future, timeout)
+
+        return None
+
+    def receive_command_response(self, data):
+        if "id" in data:
+            if int(data["id"]) in self.futures:
+                self.futures[int(data["id"])].set_result(data)
+
+    def connection_disposed(self):
+        for key in self.futures.keys():
+            self.instance_disposed(key=key)
+# endregion
+
+# region Regular socket connection class
 
 
 class SocketConnection():
@@ -41,8 +362,13 @@ class SocketConnection():
         self.socket = socket
         self.mode = mode
 
-        self._pending_commands = {}
         self._next_command_id = 1
+
+        self.response_subscribers = []
+        self.disposed_subscribers = []
+
+        self._command_factory = CommandFactory(self)
+
         self._active_thread = 0
         self._id = '{0}:{1} <- {2} -> {3}:{4}'.format(
             *list(self.socket.getsockname()), self.mode, *list(self.socket.getpeername()))
@@ -86,7 +412,6 @@ class SocketConnection():
 
             if responses == b'':
                 logging.info("%s: Received EOF. Socket has closed.", self._id)
-                self._cancel_pending_command_invocations_with_exception(None)
                 self.dispose()
                 break
 
@@ -97,60 +422,27 @@ class SocketConnection():
                 logging.debug("%s: Handling response: %s",
                               self._id, json.dumps(r))
 
-                if "id" in j:
-                    self._set_command_invocation_result(int(j["id"]), j)
-
-    def _cancel_pending_command_invocations_with_exception(self, ex):
-        pending_commands = self._pending_commands
-        self._pending_commands = {}
-
-        for (command_id, future) in pending_commands.items():
-            logging.debug(
-                "%s: Set exception on future for command id %d", self._id, command_id)
-            future.set_exception(ex)
-
-    def _set_command_invocation_result(self, command_id, *args):
-        if command_id in self._pending_commands:
-            future = self._pending_commands[command_id]
-            del self._pending_commands[command_id]
-            logging.debug("%s: Response belongs to command id %d, setting result of future",
-                          self._id, command_id)
-            future.set_result(*args)
+                for s in self.response_subscribers:
+                    if s(j):
+                        break
 
     def invoke_command(self, method_name, *params):
         command_id = self._next_command_id
         self._next_command_id += 1
 
-        future = futures.Future()
-        future.set_running_or_notify_cancel()
-        self._pending_commands[command_id] = future
-
-        logging.debug("%s: Invoking command id %d, method %s, params %s",
-                      self._id, command_id, method_name, json.dumps(params))
-
-        def done_callback(f):
-            logging.debug("%s: Future for command id %d is done",
-                          self._id, command_id)
-            if command_id in self._pending_commands:
-                del self._pending_commands[command_id]
-
-        future.add_done_callback(done_callback)
-
-        self.send((json.dumps(
-            {"id": command_id, "method": method_name, "params": params}) + "\r\n").encode())
-
-        return future
+        return self._command_factory.get_or_build(command_id, method_name, *params)
 
     def dispose(self):
         logging.info("%s: Yeelight socket disposed", self._id)
 
         self.socket.close()
 
-        if self.mode == "socket" and self.ip in socket_connections:
-            del socket_connections[self.ip]
+        for s in self.disposed_subscribers:
+            if s():
+                break
+# endregion
 
-        if self.mode == "socket" and self.ip in socket_connection_attempts:
-            del socket_connection_attempts[self.ip]
+# region Music mode socket connection class
 
 
 class MusicModeSocketConnection(SocketConnection):
@@ -167,11 +459,8 @@ class MusicModeSocketConnection(SocketConnection):
 
     def dispose(self):
         self.request.close_connection = True
+        self.request.finish()
         super().dispose()
-        self.request.finish(force=True)
-
-        if self.ip in music_mode_connections:
-            del music_mode_connections[self.ip]
 
 
 def discover(bridge_config, new_lights):
@@ -188,19 +477,19 @@ def discover(bridge_config, new_lights):
     sock.sendto(message.encode(), group)
     while True:
         try:
-            response = sock.recv(1024).decode('utf-8').split("\r\n")
-            properties = {"rgb": False, "ct": False}
-            for line in response:
-                if line[:2] == "id":
-                    properties["id"] = line[4:]
-                elif line[:3] == "rgb":
-                    properties["rgb"] = True
-                elif line[:2] == "ct":
-                    properties["ct"] = True
-                elif line[:8] == "Location":
-                    properties["ip"] = line.split(":")[2][2:]
-                elif line[:4] == "name":
-                    properties["name"] = line[6:]
+            result = {key: value for (key, value) in [line.split(": ", 1) for line in sock.recv(1024).decode('utf-8').split("\r\n")]}
+            properties = {
+                "rgb": False if "rgb" not in result else True,
+                "ct": False if "ct" not in result else True
+            }
+
+            if "id" in result:
+                properties["id"] = result["id"]
+            if "Location" in result:
+                properties["ip"] = result["Location"][11:][:-6]
+            if "name" in result:
+                properties["name"] = result["name"]
+
             device_exist = False
             for light in bridge_config["lights_address"].keys():
                 if bridge_config["lights_address"][light]["protocol"] == "yeelight" and bridge_config["lights_address"][light]["id"] == properties["id"]:
@@ -229,303 +518,463 @@ def discover(bridge_config, new_lights):
             logging.debug('Yeelight search end')
             sock.close()
             break
+# endregion
+
+# region Protocol HTTP/TCP request handler delegate (For music mode socket handling)
 
 
-def handle_request(request_handler):
-    # Bulb is creating a TCP socket with the server
-    ip = request_handler.client_address[0]
+class YeelightRequestHandlerDelegate():
+    """
+    Class that is instantiated when the bridge's HTTP server has an incoming connection from an IP address representing a Yeelight bulb on the bridge.
+    """
 
-    logging.info("%s incoming connection by music mode", ip)
-    if ip in music_mode_connections:
-        logging.info(
-            "%s already has music mode connection, is trying to connect again", ip)
-        music_mode_connections[ip].dispose()
+    def __init__(self, protocol, request_handler):
+        """
+        Constructor.
 
-    music_mode_connections[ip] = MusicModeSocketConnection(ip, request_handler)
-    music_mode_connections[ip].start()
+        Parameters
+        ----------
+        protocol : YeelightProtocol
+            Instance of Yeelight protocol class
+        request_handler : BaseHTTPRequestHandler
+            Request handler instance that started handling the incoming connection on the HTTP server.
+        """
 
-    return False
+        self.protocol = protocol
+        self.request_handler = request_handler
 
+    def handle(self):
+        """
+        Handles an incoming connection (after BaseHTTPRequestHandler.setup(), before BaseHTTPRequestHandler().finish())
 
-def new_connection(ip):
-    while ip in socket_connection_attempts:
-        logging.debug(
-            "New connection method blocked until previous attempt finished for %s", ip)
-        time.sleep(1)
+        Returns
+        -------
+        True
+            This prevents the BaseHTTPRequestHandler's handle() method from being called, stopping it treating the connection as a HTTP request which closes the connection due to it not being HTTP.
+        """
 
-    if ip in socket_connections:
-        logging.info(
-            "New connection method answered with recently created socket for %s", ip)
-        return socket_connections[ip]
+        # Bulb is creating a TCP socket with the server
+        ip = self.request_handler.client_address[0]
 
-    logging.info("Creating new socket to %s", ip)
+        logging.info("%s incoming connection by music mode", ip)
+        music_mode_connection = self.protocol.connection_factory.music_sockets.get(
+            ip)
+        if music_mode_connection is not None and music_mode_connection.done() and not music_mode_connection.cancelled():
+            try:
+                if music_mode_connection.result().request == self.request_handler:
+                    pass
+                else:
+                    logging.info(
+                        "%s already has music mode connection, is trying to connect again", ip)
+                    music_mode_connection.result().dispose()
+            except:
+                pass  # connection in error state shouldn't happen
 
-    socket_connection_attempts[ip] = True
-
-    try:
-        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp_socket.settimeout(None)
-        tcp_socket.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
-        tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        tcp_socket.connect((ip, int(55443)))
-        connection = SocketConnection(ip, tcp_socket)
+        connection = MusicModeSocketConnection(ip, self.request_handler)
+        self.protocol.connection_factory.music_sockets.connection_established(
+            connection)
         connection.start()
 
-        socket_connections[ip] = connection
-        if ip in socket_connection_attempts:
-            del socket_connection_attempts[ip]
+        return True
+# endregion
 
-        set_music_on(connection)
-    except Exception as ex:
-        logging.warn("Connection to %s failed: ", json.dumps(ex))
-        connection.dispose()
-        raise
-
-    return connection
+# region Regular socket connection factory (using Futures)
 
 
-def set_music_on(connection):
-    try:
+class SocketConnectionFactory(FutureFactory):
+    """
+    Factory that creates new connections to Yeelight bulbs over port 55443.
+    """
+
+    def __init__(self):
+        super().__init__(lambda s: s.ip)
+        self.persist_after_result = True
+
+    def build(self, ip, future):
+        """
+        Build a new connection to *ip*.
+
+        Parameters
+        ----------
+        ip: str
+            IP address to connect to
+        """
+        try:
+            tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcp_socket.settimeout(None)
+            tcp_socket.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+            tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            tcp_socket.connect((ip, int(55443)))
+            connection = SocketConnection(ip, tcp_socket)
+            try:
+                connection.disposed_subscribers.append(
+                    lambda s: self.instance_disposed(instance=s, key=ip, future=future))
+                connection.start()
+            except:
+                connection.dispose()
+                raise
+
+            return connection
+        except:
+            logging.exception("Connection to %s failed: ", ip)
+            raise
+# endregion
+
+# region Music mode socket connection (using Futures)
+
+
+class MusicModeSocketConnectionFactory(SocketConnectionFactory):
+    """
+    Factory that attempts to establish a music mode connection to a Yeelight bulb using an existing SocketConnection instance.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def get_or_build(self, connection, timeout=5):
+        """
+        Retrives an existing music mode connection, or returns a future possibly establishing a music mode connection later on.
+
+        Parameters
+        ----------
+        ip: str
+            IP address to connect to
+        connection: SocketConnection
+            Existing socket connection to send music mode on message over
+        """
+        return super().get_or_build(ip, key=connection.ip, connection=connection, timeout=timeout)
+
+    def future_done_callback(self, future, key, *args, connection, **kwargs):
+        """
+        Overriden super's future_done_callback for logging.
+        """
+        try:
+            future.result()
+        except Exception as ex:
+            logging.exception(
+                "Set music on command for %s failed", connection.ip)
+
+        super().future_done_callback(future, key)
+
+    def connection_established(self, connection):
+        """
+        Call when the bulb has established a TCP socket to the server over * connection*.
+
+        Parameters
+        ----------
+        connection: MusicModeConnection
+            Connection over which the music mode connection was established
+        """
+        key = self.key_selector(connection)
+
+        connection.disposed_subscribers.append(
+            lambda: self.instance_disposed(instance=connection, key=key))
+
+        if key in self.futures:
+            self.futures[key].set_result(connection)
+        else:
+            connection.dispose()
+
+    def build(self, ip, future, *args, connection, timeout, **kwargs):
+        """
+        Attempts to build a music mode connection by dispatching set_music command over * connection*.
+
+        Parameters
+        ----------
+        ip: str
+            Bulb IP(should match connection.ip)
+
+        future: Future
+            Future to resolve when connection is established
+
+        connection: SocketConnection
+            SocketConnection instance to dispatch command over
+
+        timeout: int
+            Seconds before music mode connection attempt times out
+        """
         server_ip = getIpAddress()
         logging.info("Setting music on for %s (to %s)",
                      connection.ip, server_ip)
-        data = connection.invoke_command(
-            "set_music", 1, server_ip, 80).result(5)
 
-        logging.info("Set music on for %s returned %s",
-                     connection.ip, json.dumps(data["result"]))
+        command = connection.invoke_command(
+            "set_music", 1, server_ip, 80)
+        command.add_done_callback(
+            lambda f: self.command_future_done_callback(f, ip, future, connection=connection))
 
-    except TimeoutError as ex:
-        logging.info("Setting music on for %s failed %s",
-                     connection.ip, json.dumps(ex))
+        if timeout:
+            self.future_timeout(future, timeout)
 
-
-def get_existing_connection(ip, music=True, socket=True, log=False):
-    if ip in music_mode_connections and music:
-        if log:
-            logging.debug("Fetched music connection for %s", ip)
-        return music_mode_connections[ip]
-    elif ip in socket_connections and socket:
-        if log:
-            logging.debug("Fetched socket connection for %s", ip)
-        return socket_connections[ip]
-    else:
-        if log:
-            logging.debug("No connections for %s", ip)
         return None
 
+    def command_future_done_callback(self, future, ip, connection_future, connection):
+        """
+        Listens for result of set_music command and reacts accordingly.
 
-def get_or_create_connection(ip, music=True, socket=True):
-    connection = get_existing_connection(ip, music, socket, log=True)
+        Parameters
+        ----------
+        future: Future
+            Command future containing result or exception(is done)
+        ip: str
+            IP address of bulb
+        connection_future: Future
+            Music mode connection attempt future(from build)
+        connection: SocketConnection
+            Connection that command was sent on
+        """
+        try:
+            data = future.result()
 
-    if connection is not None:
-        return connection
+            logging.info("Set music on command for %s returned %s",
+                         connection.ip, json.dumps(data))
 
-    return new_connection(ip)
-
-
-def minimum_msec_between_commands_for_ip(ip):
-    connection = get_existing_connection(ip, log=False)
-
-    if connection is not None and connection.mode == 'music':
-        return MINIMUM_MSEC_BETWEEN_COMMANDS_MUSIC
-
-    return MINIMUM_MSEC_BETWEEN_COMMANDS
-
-
-def queue_set_light_data(ip, light, data):
-    if ip not in queued_set_light_data:
-        queued_set_light_data[ip] = {
-            "timestamp": 0,
-            "data": {},
-            "timer": None
-        }
-
-    if data is not None:
-        queued_set_light_data[ip]["data"].update(data)
-
-    callback = partial(do_set_light_data, ip, light,
-                       queued_set_light_data[ip])
-
-    now = event_loop.time() * 1000
-    delay = (minimum_msec_between_commands_for_ip(ip))
-    last_time = queued_set_light_data[ip]["timestamp"]
-
-    if queued_set_light_data[ip]["timer"] is None:
-        if now - last_time > delay:
-            logging.debug(
-                "last set_light call for %s was more than %f ms ago (was %f ms), invoking now", ip, delay, now - last_time)
-            queued_set_light_data[ip]["timer"] = event_loop.call_soon_threadsafe(
-                callback)
-        else:
-            logging.debug("last set_light call for %s was %f ms ago, invoking in %f",
-                          ip, now - last_time, now - last_time + delay)
-            queued_set_light_data[ip]["timer"] = event_loop.call_soon_threadsafe(
-                partial(event_loop.call_at, (last_time + delay) / 1000, callback))
-    else:
-        logging.debug(
-            "last set_light call for %s was %f ms ago, already queued", ip, now - last_time)
+            if "error" in data:
+                raise Exception(json.dumps(data))
+        except Exception as ex:
+            connection_future.set_exception(ex)
+# endregion
 
 
-def do_set_light_data(ip, light, data):
-    try:
-        commands(ip, light, data["data"])
-    finally:
-        data["timestamp"] = event_loop.time() * 1000
-        data["data"] = {}
-        data["timer"] = None
+class YeelightProtocol(Protocol):
+    """
+    Class containing an implementation of Protocol for Yeelight bulbs.
+    """
+    def __init__(self):
+        self._sockets = SocketConnectionFactory()
+        self._music_sockets = MusicModeSocketConnectionFactory()
+        self._queued_set_light_data = {}
 
+        self.connection_factory = YeelightConnectionFactory(
+            self._sockets, self._music_sockets)
 
-def commands(ip, light, data):
-    try:
-        connection = get_or_create_connection(ip)
-    except Exception as ex:
-        raise
+        self.RequestHandlerDelegateClass = YeelightRequestHandlerDelegate
 
-    payload = convert_to_payload(data, light)
+        self.event_loop = asyncio.new_event_loop()
+        Thread(name="yeelight-command-queue",
+               target=self.event_loop.run_forever).start()
 
-    msg = ""
-    for (method, params) in payload.items():
-        msg += json.dumps(
-            {"id": 0, "method": method, "params": params}) + "\r\n"
-
-    try:
-        connection.send(msg.encode())
-    except Exception as ex:
-        logging.exception("Command send exception")
-        if connection.mode == 'music':
-            logging.info("Retrying command on another connection")
-            return commands(ip, light, data)
-        else:
+# region Protocol implementation
+    def get_light_state(self, ip, light):
+        state = {}
+        try:
+            connection = self.connection_factory.get_or_build(
+                ip, music=False).result(5)
+        except Exception as ex:
             raise
 
+        data = connection.invoke_command(
+            "get_prop", "power", "bright").result(3)
+        light_data = data["result"]
 
-def convert_to_payload(data, light):
-    payload = {}
-
-    sudden = ["sudden", 50]
-
-    will_transition = "rapid" not in data or RAPID_SMOOTH
-    transition = sudden
-
-    if will_transition:
-        transition = [
-            "smooth",
-            RAPID_SMOOTH_TRANSITION_TIME if "rapid" in data and RAPID_SMOOTH and RAPID_SMOOTH_TRANSITION_TIME is not None else data.get("transitiontime", 400)]
-
-    if "on" in data:
-        if data["on"]:
-            payload["set_power"] = ["on", *transition]
+        if light_data[0] == "on":  # powerstate
+            state['on'] = True
         else:
-            payload["set_power"] = ["off", *transition]
+            state['on'] = False
+        state["bri"] = int(int(light_data[1]) * 2.54)
 
-    if "bri" in data:
-        payload["set_bright"] = [
-            int(data["bri"] / 2.55) + 1, *transition]
+        data = connection.invoke_command("get_prop", "color_mode").result(3)
+        if data["result"][0] == "1":  # rgb mode
+            data = connection.invoke_command("get_prop", "rgb").result(3)
+            hue_data = data["result"]
+            hex_rgb = "%6x" % int(hue_data[0])
+            r = hex_rgb[: 2]
+            if r == "  ":
+                r = "00"
+            g = hex_rgb[3: 4]
+            if g == "  ":
+                g = "00"
+            b = hex_rgb[-2:]
+            if b == "  ":
+                b = "00"
+            state["xy"] = convert_rgb_xy(int(r, 16), int(g, 16), int(b, 16))
+            state["colormode"] = "xy"
+        elif data["result"][0] == "2":  # ct mode
+            data = connection.invoke_command("get_prop", "ct").result(3)
+            state["ct"] = int(
+                1000000 / int(data["result"][0]))
+            state["colormode"] = "ct"
 
-    if "ct" in data:
-        payload["set_ct_abx"] = [
-            int(1000000 / data["ct"]), *transition]
+        elif data["result"][0] == "3":  # ct mode
+            data = connection.invoke_command(
+                "get_prop", "hue", "sat").result(3)
+            hue_data = data["result"]
+            state["hue"] = int(hue_data[0] * 182)
+            state["sat"] = int(int(hue_data[1]) * 2.54)
+            state["colormode"] = "hs"
+        return state
 
-    if "hue" in data and "sat" in data:
-        payload["set_hsv"] = [
-            int(data["hue"] / 182), int(data["sat"] / 2.54), *transition]
-    elif "hue" in data and "sat" not in data:
-        payload["set_hsv"] = [
-            int(data["hue"] / 182), int(light["state"]["sat"] / 2.54), *transition]
-    elif "hue" in data and "sat" not in data:
-        payload["set_hsv"] = [
-            int(light["state"]["hue"] / 182), int(data["sat"] / 2.54), *transition]
+    def set_light(self, ip, light, data):
+        if "transitiontime" in data:
+            data["transitiontime"] = data["transitiontime"] * 100
 
-    if "rgb" in data:
-        color = data["rgb"]
-        payload["set_rgb"] = [
-            (color[0] * 65536) + (color[1] * 256) + color[2], *transition]
+        self.enqueue_set_light_data(ip, light, data)
+# endregion
 
-    elif "xy" in data:  # prefer rgb if possible over xy
+# region Command queueing methods
+    def enqueue_set_light_data(self, ip, light, data):
+        if ip not in self._queued_set_light_data[ip]:
+            self._queued_set_light_data[ip] = {
+                "timestamp": 0,
+                "data": {},
+                "timer": None,
+                "count": 0,
+                "delay": None
+            }
+
+        queued_data = self._queued_set_light_data[ip]
+
+        if data is not None:
+            queued_data["data"].update(data)
+
+        callback = partial(self.dequeue_set_light_data, ip, light,
+                           queued_data)
+
+        now = self.event_loop.time() * 1000
+        delay = self.minimum_msec_between_commands_for_ip(ip)
+        last_time = queued_data["timestamp"]
+
+        queued_data["count"] += 1
+
+        if queued_data["timer"] is None:
+            if now - last_time > delay:
+                logging.debug(
+                    "last set_light call for %s was more than %f ms ago (was %f ms), invoking now", ip, delay, now - last_time)
+                queued_data["timer"] = self.event_loop.call_soon_threadsafe(
+                    callback)
+            else:
+                logging.debug("last set_light call for %s was %f ms ago, invoking in %f",
+                              ip, now - last_time, delay - now + last_time)
+                queued_data["delay"] = delay
+                queued_data["timer"] = self.event_loop.call_soon_threadsafe(
+                    lambda: self.event_loop.call_at((last_time + delay) / 1000, callback))
+        else:
+            logging.debug(
+                "last set_light call for %s was %f ms ago, already queued", ip, now - last_time)
+
+    def dequeue_set_light_data(self, ip, light, data):
+        try:
+            self.run_commands(ip, light, data)
+
+        finally:
+            data["timestamp"] = self.event_loop.time() * 1000
+            data["data"] = {}
+            data["timer"] = None
+            data["count"] = 0
+            data["delay"] = None
+# endregion
+
+# region Command executor
+    def run_commands(self, ip, light, command_data):
+        try:
+            connection = self.connection_factory.get_or_build(ip).result(5)
+        except Exception as ex:
+            raise
+
+        data = command_data["data"]
+        if command_data["delay"] is not None and connection.mode != "music" and command_data["count"] >= 3:
+            # More than 3 requests attempted within a small amount of time? turn music mode on
+            try:
+                self.connection_factory.music_sockets.get_or_build(
+                    ip, connection)
+            except Exception as ex:
+                pass
+
+        payload = self.convert_to_payload(data, light)
+
+        msg = ""
+        for (method, params) in payload.items():
+            msg += json.dumps(
+                {"id": 0, "method": method, "params": params}) + "\r\n"
+
+        try:
+            connection.send(msg.encode())
+        except Exception as ex:
+            logging.exception("Command send exception")
+            if connection.mode == 'music':
+                logging.info("Retrying command on another connection")
+                return self.run_commands(ip, light, data)
+            else:
+                raise
+# endregion
+
+# region Command queue interval method
+    def minimum_msec_between_commands_for_ip(self, ip):
+        connection = self.connection_factory.get(ip)
+
+        if connection is not None and connection.result().mode == 'music':
+            return MINIMUM_MSEC_BETWEEN_COMMANDS_MUSIC
+
+        return MINIMUM_MSEC_BETWEEN_COMMANDS
+# endregion
+
+# region Hue data to Yeelight payload converter method
+    def convert_to_payload(self, data, light):
+        payload = {}
+
+        sudden = ["sudden", 50]
+
+        will_transition = "rapid" not in data or RAPID_SMOOTH
+        transition = sudden
+
+        if will_transition:
+            transition = [
+                "smooth",
+                RAPID_SMOOTH_TRANSITION_TIME if "rapid" in data and RAPID_SMOOTH and RAPID_SMOOTH_TRANSITION_TIME is not None else data.get("transitiontime", 400)]
+
+        if "on" in data and "rapid" not in data:
+            if data["on"]:
+                payload["set_power"] = ["on", *transition]
+            else:
+                payload["set_power"] = ["off", *transition]
+
         if "bri" in data:
-            bri = data["bri"]
-        else:
-            bri = light["state"]["bri"]
+            payload["set_bright"] = [
+                int(data["bri"] / 2.55) + 1, *transition]
 
-        color = convert_xy(data["xy"][0], data["xy"][1], bri)
-        # according to docs, yeelight needs this to set rgb. its r * 65536 + g * 256 + b
-        payload["set_rgb"] = [
-            (color[0] * 65536) + (color[1] * 256) + color[2], *transition]
+        if "ct" in data:
+            payload["set_ct_abx"] = [
+                int(1000000 / data["ct"]), *transition]
 
-    if "alert" in data and data["alert"] != "none":
-        payload["start_cf"] = [
-            4, 0, "1000, 2, 5500, 100, 1000, 2, 5500, 1, 1000, 2, 5500, 100, 1000, 2, 5500, 1"]
+        if "hue" in data and "sat" in data:
+            payload["set_hsv"] = [
+                int(data["hue"] / 182), int(data["sat"] / 2.54), *transition]
+        elif "hue" in data and "sat" not in data:
+            payload["set_hsv"] = [
+                int(data["hue"] / 182), int(light["state"]["sat"] / 2.54), *transition]
+        elif "hue" in data and "sat" not in data:
+            payload["set_hsv"] = [
+                int(light["state"]["hue"] / 182), int(data["sat"] / 2.54), *transition]
 
-    if COMBI_COMMANDS >= 1 and "set_rgb" in payload and "set_bright" in payload:
-        if COMBI_COMMANDS == 1:
-            payload["set_scene"] = [
-                "color", payload["set_rgb"][0], payload["set_bright"][0]]
-        elif COMBI_COMMANDS == 2:
-            payload["start_cf"] = [1, 1, "{0},1,{1},{2}".format(min(transition[1], 50) if will_transition else 50,
-                                                                payload["set_rgb"][0], payload["set_bright"][0])]
+        if "rgb" in data:
+            color = data["rgb"]
+            payload["set_rgb"] = [
+                (color[0] * 65536) + (color[1] * 256) + color[2], *transition]
 
-        del payload["set_rgb"]
-        del payload["set_bright"]
+        elif "xy" in data:  # prefer rgb if possible over xy
+            if "bri" in data:
+                bri = data["bri"]
+            else:
+                bri = light["state"]["bri"]
 
-    return payload
+            color = convert_xy(data["xy"][0], data["xy"][1], bri)
+            # according to docs, yeelight needs this to set rgb. its r * 65536 + g * 256 + b
+            payload["set_rgb"] = [
+                (color[0] * 65536) + (color[1] * 256) + color[2], *transition]
 
+        if "alert" in data and data["alert"] != "none":
+            payload["start_cf"] = [
+                4, 0, "1000, 2, 5500, 100, 1000, 2, 5500, 1, 1000, 2, 5500, 100, 1000, 2, 5500, 1"]
 
-def set_light(ip, light, data):
-    method = 'TCP'
-    payload = {}
-    transitiontime = 400
+        if COMBI_COMMANDS >= 1 and "set_rgb" in payload and "set_bright" in payload:
+            if COMBI_COMMANDS == 1:
+                payload["set_scene"] = [
+                    "color", payload["set_rgb"][0], payload["set_bright"][0]]
+            elif COMBI_COMMANDS == 2:
+                payload["start_cf"] = [1, 1, "{0},1,{1},{2}".format(min(transition[1], 50) if will_transition else 50,
+                                                                    payload["set_rgb"][0], payload["set_bright"][0])]
 
-    if "transitiontime" in data:
-        data["transitiontime"] = data["transitiontime"] * 100
-    else:
-        pass
+            del payload["set_rgb"]
+            del payload["set_bright"]
 
-    queue_set_light_data(ip, light, data)
-
-
-def get_light_state(ip, light):
-    state = {}
-    try:
-        connection = get_or_create_connection(ip, music=False)
-    except Exception as ex:
-        raise
-
-    data = connection.invoke_command("get_prop", "power", "bright").result(3)
-    light_data = data["result"]
-
-    if light_data[0] == "on":  # powerstate
-        state['on'] = True
-    else:
-        state['on'] = False
-    state["bri"] = int(int(light_data[1]) * 2.54)
-
-    data = connection.invoke_command("get_prop", "color_mode").result(3)
-    if data["result"][0] == "1":  # rgb mode
-        data = connection.invoke_command("get_prop", "rgb").result(3)
-        hue_data = data["result"]
-        hex_rgb = "%6x" % int(hue_data[0])
-        r = hex_rgb[: 2]
-        if r == "  ":
-            r = "00"
-        g = hex_rgb[3: 4]
-        if g == "  ":
-            g = "00"
-        b = hex_rgb[-2:]
-        if b == "  ":
-            b = "00"
-        state["xy"] = convert_rgb_xy(int(r, 16), int(g, 16), int(b, 16))
-        state["colormode"] = "xy"
-    elif data["result"][0] == "2":  # ct mode
-        data = connection.invoke_command("get_prop", "ct").result(3)
-        state["ct"] = int(
-            1000000 / int(data["result"][0]))
-        state["colormode"] = "ct"
-
-    elif data["result"][0] == "3":  # ct mode
-        data = connection.invoke_command("get_prop", "hue", "sat").result(3)
-        hue_data = data["result"]
-        state["hue"] = int(hue_data[0] * 182)
-        state["sat"] = int(int(hue_data[1]) * 2.54)
-        state["colormode"] = "hs"
-    return state
+        return payload
+# endregion
