@@ -14,10 +14,17 @@ from functions import light_types, nextFreeId
 from functions.colors import convert_rgb_xy, convert_xy
 from HueEmulator3 import getIpAddress
 
-COLOR_FLOW_TIME = 30
+# Minimum time between commands in socket mode
 MINIMUM_MSEC_BETWEEN_COMMANDS = 300
-MINIMUM_MSEC_BETWEEN_COMMANDS_MUSIC = 30
-TRANSITION = ["sudden", 30]
+# Minimum time between commands in music mode
+MINIMUM_MSEC_BETWEEN_COMMANDS_MUSIC = 15
+
+# Combine rgb + brightness commands: off (0), set_scene (1), start_flow (2, 50ms)
+COMBI_COMMANDS = 0
+# If true, use smooth transition instead of sudden when receiving rapid requests (from Hue Entertainment)
+RAPID_SMOOTH = False
+# If RAPID_SMOOTH is True, what should the smooth transition time be? Set to None to keep value from data
+RAPID_SMOOTH_TRANSITION_TIME = 50
 
 music_mode_connections = {}
 socket_connections = {}
@@ -80,6 +87,7 @@ class SocketConnection():
             if responses == b'':
                 logging.info("%s: Received EOF. Socket has closed.", self._id)
                 self._cancel_pending_command_invocations_with_exception(None)
+                self.dispose()
                 break
 
             response_list = responses.splitlines()
@@ -328,7 +336,7 @@ def minimum_msec_between_commands_for_ip(ip):
 def queue_set_light_data(ip, light, data):
     if ip not in queued_set_light_data:
         queued_set_light_data[ip] = {
-            "timestamp": None,
+            "timestamp": 0,
             "data": {},
             "timer": None
         }
@@ -336,35 +344,35 @@ def queue_set_light_data(ip, light, data):
     if data is not None:
         queued_set_light_data[ip]["data"].update(data)
 
+    callback = partial(do_set_light_data, ip, light,
+                       queued_set_light_data[ip])
+
+    now = event_loop.time() * 1000
+    delay = (minimum_msec_between_commands_for_ip(ip))
+    last_time = queued_set_light_data[ip]["timestamp"]
+
     if queued_set_light_data[ip]["timer"] is None:
-        callback = partial(do_set_light_data, ip, light,
-                           queued_set_light_data[ip])
-
-        if queued_set_light_data[ip]["timestamp"] is None:
-            logging.debug("First set_light call for %s, invoking now", ip)
-            callback()
+        if now - last_time > delay:
+            logging.debug(
+                "last set_light call for %s was more than %f ms ago (was %f ms), invoking now", ip, delay, now - last_time)
+            queued_set_light_data[ip]["timer"] = event_loop.call_soon_threadsafe(
+                callback)
         else:
-            now = event_loop.time() * 1000
-            delay = (minimum_msec_between_commands_for_ip(ip))
-            last_time = queued_set_light_data[ip]["timestamp"]
-
-            if now - last_time > delay:
-                logging.debug(
-                    "last set_light call for %s was more than %f ms ago (was %f ms), invoking now", ip, delay, now - last_time)
-                callback()
-            elif queued_set_light_data[ip]["timer"] is None:
-                logging.debug(
-                    "last set_light call for %s was %f ms ago, invoking in %f", ip, now - last_time, delay)
-                queued_set_light_data[ip]["timer"] = event_loop.call_soon_threadsafe(
-                    partial(event_loop.call_at, (now + delay) / 1000, callback))
+            logging.debug("last set_light call for %s was %f ms ago, invoking in %f",
+                          ip, now - last_time, now - last_time + delay)
+            queued_set_light_data[ip]["timer"] = event_loop.call_soon_threadsafe(
+                partial(event_loop.call_at, (last_time + delay) / 1000, callback))
+    else:
+        logging.debug(
+            "last set_light call for %s was %f ms ago, already queued", ip, now - last_time)
 
 
 def do_set_light_data(ip, light, data):
     try:
-        data["timestamp"] = event_loop.time() * 1000
         commands(ip, light, data["data"])
-        data["data"] = {}
     finally:
+        data["timestamp"] = event_loop.time() * 1000
+        data["data"] = {}
         data["timer"] = None
 
 
@@ -395,34 +403,44 @@ def commands(ip, light, data):
 def convert_to_payload(data, light):
     payload = {}
 
+    sudden = ["sudden", 50]
+
+    will_transition = "rapid" not in data or RAPID_SMOOTH
+    transition = sudden
+
+    if will_transition:
+        transition = [
+            "smooth",
+            RAPID_SMOOTH_TRANSITION_TIME if "rapid" in data and RAPID_SMOOTH and RAPID_SMOOTH_TRANSITION_TIME is not None else data.get("transitiontime", 400)]
+
     if "on" in data:
         if data["on"]:
-            payload["set_power"] = ["on", *TRANSITION]
+            payload["set_power"] = ["on", *transition]
         else:
-            payload["set_power"] = ["off", *TRANSITION]
+            payload["set_power"] = ["off", *transition]
 
     if "bri" in data:
         payload["set_bright"] = [
-            int(data["bri"] / 2.55) + 1, *TRANSITION]
+            int(data["bri"] / 2.55) + 1, *transition]
 
     if "ct" in data:
         payload["set_ct_abx"] = [
-            int(1000000 / data["ct"]), *TRANSITION]
+            int(1000000 / data["ct"]), *transition]
 
     if "hue" in data and "sat" in data:
         payload["set_hsv"] = [
-            int(data["hue"] / 182), int(data["sat"] / 2.54), *TRANSITION]
+            int(data["hue"] / 182), int(data["sat"] / 2.54), *transition]
     elif "hue" in data and "sat" not in data:
         payload["set_hsv"] = [
-            int(data["hue"] / 182), int(light["state"]["sat"] / 2.54), *TRANSITION]
+            int(data["hue"] / 182), int(light["state"]["sat"] / 2.54), *transition]
     elif "hue" in data and "sat" not in data:
         payload["set_hsv"] = [
-            int(light["state"]["hue"] / 182), int(data["sat"] / 2.54), *TRANSITION]
+            int(light["state"]["hue"] / 182), int(data["sat"] / 2.54), *transition]
 
     if "rgb" in data:
         color = data["rgb"]
         payload["set_rgb"] = [
-            (color[0] * 65536) + (color[1] * 256) + color[2], *TRANSITION]
+            (color[0] * 65536) + (color[1] * 256) + color[2], *transition]
 
     elif "xy" in data:  # prefer rgb if possible over xy
         if "bri" in data:
@@ -433,11 +451,22 @@ def convert_to_payload(data, light):
         color = convert_xy(data["xy"][0], data["xy"][1], bri)
         # according to docs, yeelight needs this to set rgb. its r * 65536 + g * 256 + b
         payload["set_rgb"] = [
-            (color[0] * 65536) + (color[1] * 256) + color[2], *TRANSITION]
+            (color[0] * 65536) + (color[1] * 256) + color[2], *transition]
 
     if "alert" in data and data["alert"] != "none":
         payload["start_cf"] = [
             4, 0, "1000, 2, 5500, 100, 1000, 2, 5500, 1, 1000, 2, 5500, 100, 1000, 2, 5500, 1"]
+
+    if COMBI_COMMANDS >= 1 and "set_rgb" in payload and "set_bright" in payload:
+        if COMBI_COMMANDS == 1:
+            payload["set_scene"] = [
+                "color", payload["set_rgb"][0], payload["set_bright"][0]]
+        elif COMBI_COMMANDS == 2:
+            payload["start_cf"] = [1, 1, "{0},1,{1},{2}".format(min(transition[1], 50) if will_transition else 50,
+                                                                payload["set_rgb"][0], payload["set_bright"][0])]
+
+        del payload["set_rgb"]
+        del payload["set_bright"]
 
     return payload
 
@@ -446,8 +475,11 @@ def set_light(ip, light, data):
     method = 'TCP'
     payload = {}
     transitiontime = 400
+
     if "transitiontime" in data:
-        transitiontime = data["transitiontime"] * 10
+        data["transitiontime"] = data["transitiontime"] * 100
+    else:
+        pass
 
     queue_set_light_data(ip, light, data)
 

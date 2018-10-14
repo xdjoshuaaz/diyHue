@@ -164,10 +164,12 @@ def entertainmentService():
                             if lightId not in lightStatus:
                                 lightStatus[lightId] = {"on": False, "bri": 1, "xy": [-999, -999], "rgb": (-1, -1, -1)}
 
+                            bri = max(r, g, b)
+
                             if r == 0 and  g == 0 and  b == 0:
                                 bridge_config["lights"][str(lightId)]["state"]["on"] = False
                             else:
-                                bridge_config["lights"][str(lightId)]["state"].update({"on": True, "bri": int((r + g + b) / 3), "xy": convert_rgb_xy(r, g, b), "colormode": "xy"})
+                                bridge_config["lights"][str(lightId)]["state"].update({"on": True, "bri": bri, "xy": convert_rgb_xy(r, g, b), "colormode": "xy"})
                             if bridge_config["lights_address"][str(lightId)]["protocol"] == "native":
                                 if bridge_config["lights_address"][str(lightId)]["ip"] not in nativeLights:
                                     nativeLights[bridge_config["lights_address"][str(lightId)]["ip"]] = {}
@@ -188,7 +190,6 @@ def entertainmentService():
                                         xy = convert_rgb_xy(r, g, b)
 
                                         if (r, g, b) != lightStatus[lightId]["rgb"]:
-                                            bri = int((r + b + g) / 3)
                                             if abs(bri - lightStatus[lightId]["bri"]) > 0:
                                                 patch.update({"bri": bri, "transitiontime": 3})
                                                 lightStatus[lightId]["bri"] = bri
@@ -202,6 +203,7 @@ def entertainmentService():
                                             lightStatus[lightId]["rgb"] = (r, g, b)
                                     
                                     if len(patch.keys()) > 0:
+                                        patch.update({"rapid": True})
                                         sendLightRequest(str(lightId), patch)
 
                             fremeID += 1
@@ -232,6 +234,7 @@ def entertainmentService():
 
                                 fremeID += 1
                                 if yeelight or fremeID == 25 : #24 = every seconds, increase in case the destination device is overloaded
+                                    patch.update({"rapid": True})
                                     sendLightRequest(str(lightId), {"xy": [x, y], "bri": bri})
                                     
                                 if fremeID == 25:
