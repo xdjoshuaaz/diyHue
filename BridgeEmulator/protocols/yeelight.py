@@ -11,9 +11,8 @@ from collections import namedtuple
 import asyncio
 import threading
 import socketserver
-from functions import light_types, nextFreeId
+from functions import light_types, nextFreeId, getIpAddress
 from functions.colors import convert_rgb_xy, convert_xy
-from HueEmulator3 import getIpAddress
 from .base import Protocol
 
 # Minimum time between commands in socket mode
@@ -77,7 +76,7 @@ class FutureFactory:
             Keyword arguments that will be passed to the build method
         """
         future = self.get(key)
-        if future is not None
+        if future is not None:
             return future
 
         logging.info("%s creating new instance called %s",
@@ -142,7 +141,7 @@ class FutureFactory:
         Exception
             Raising an exception will set the future's exception automatically.
         """
-        return None
+        raise NotImplementedError()
 
     def future_done_callback(self, future, key, dispose=True, *args, **kwargs):
         """
@@ -283,7 +282,7 @@ class YeelightConnectionFactory():
         self.sockets = sockets
         self.music_sockets = music_sockets
 
-    def get_or_build(self, ip, music=True, timeout=5):
+    def get_or_build(self, ip, music=True):
         """
         Retrieve an existing connection to *ip*, or builds a new one.
 
@@ -293,15 +292,13 @@ class YeelightConnectionFactory():
             IP address to retrieve a connection for
         music : bool
             Determines if a music mode connection is suitable
-        timeout : int
-            Seconds before timing out when creating a new connection
         """
         existing_socket = self.get(ip, music=music)
 
         if existing_socket is not None:
             return existing_socket
 
-        socket = self.sockets.get_or_build(ip, timeout=timeout)
+        socket = self.sockets.get_or_build(ip)
         return socket
 
     def get(self, ip, music=True):
@@ -349,7 +346,7 @@ class CommandFactory(FutureFactory):
                 self.futures[int(data["id"])].set_result(data)
 
     def connection_disposed(self):
-        for key in self.futures.keys():
+        for key in self.futures.keys():  # todo
             self.instance_disposed(key=key)
 # endregion
 
@@ -477,7 +474,8 @@ def discover(bridge_config, new_lights):
     sock.sendto(message.encode(), group)
     while True:
         try:
-            result = {key: value for (key, value) in [line.split(": ", 1) for line in sock.recv(1024).decode('utf-8').split("\r\n")]}
+            result = {key: value for (key, value) in [line.split(
+                ": ", 1) for line in sock.recv(1024).decode('utf-8').split("\r\n")]}
             properties = {
                 "rgb": False if "rgb" not in result else True,
                 "ct": False if "ct" not in result else True
@@ -642,7 +640,7 @@ class MusicModeSocketConnectionFactory(SocketConnectionFactory):
         connection: SocketConnection
             Existing socket connection to send music mode on message over
         """
-        return super().get_or_build(ip, key=connection.ip, connection=connection, timeout=timeout)
+        return super().get_or_build(key=connection.ip, connection=connection, timeout=timeout)
 
     def future_done_callback(self, future, key, *args, connection, **kwargs):
         """
@@ -739,6 +737,8 @@ class YeelightProtocol(Protocol):
     """
     Class containing an implementation of Protocol for Yeelight bulbs.
     """
+    name = "yeelight"
+
     def __init__(self):
         self._sockets = SocketConnectionFactory()
         self._music_sockets = MusicModeSocketConnectionFactory()
@@ -812,7 +812,7 @@ class YeelightProtocol(Protocol):
 
 # region Command queueing methods
     def enqueue_set_light_data(self, ip, light, data):
-        if ip not in self._queued_set_light_data[ip]:
+        if ip not in self._queued_set_light_data:
             self._queued_set_light_data[ip] = {
                 "timestamp": 0,
                 "data": {},
@@ -874,8 +874,7 @@ class YeelightProtocol(Protocol):
         if command_data["delay"] is not None and connection.mode != "music" and command_data["count"] >= 3:
             # More than 3 requests attempted within a small amount of time? turn music mode on
             try:
-                self.connection_factory.music_sockets.get_or_build(
-                    ip, connection)
+                self.connection_factory.music_sockets.get_or_build(connection)
             except Exception as ex:
                 pass
 

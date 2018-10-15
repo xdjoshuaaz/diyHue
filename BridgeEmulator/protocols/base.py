@@ -1,5 +1,6 @@
 class Protocol():
     """Abstract base class for a bulb protocol."""
+    name = "INVALID"
 
     def __init__(self):
         raise Exception()
@@ -53,7 +54,7 @@ class Protocol():
 
 
         """
-        pass
+        raise Exception()
 
     def set_light(self, ip, light, data):
         """
@@ -100,4 +101,4 @@ class Protocol():
             }
 
         """
-        pass
+        raise Exception()
