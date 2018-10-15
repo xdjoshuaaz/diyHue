@@ -14,6 +14,7 @@ import socketserver
 from functions import light_types, nextFreeId, getIpAddress
 from functions.colors import convert_rgb_xy, convert_xy
 from .base import Protocol
+import copy
 
 # Minimum time between commands in socket mode
 MINIMUM_MSEC_BETWEEN_COMMANDS = 300
@@ -26,6 +27,8 @@ COMBI_COMMANDS = 0
 RAPID_SMOOTH = True
 # If RAPID_SMOOTH is True, what should the smooth transition time be? Set to None to keep value from data
 RAPID_SMOOTH_TRANSITION_TIME = 30
+
+CONTINUOUS_TIMER = True
 
 # region Future factory
 
@@ -346,7 +349,8 @@ class CommandFactory(FutureFactory):
                 self.futures[int(data["id"])].set_result(data)
 
     def connection_disposed(self):
-        for key in self.futures.keys():  # todo
+        keys = [k for k in self.futures.keys()]
+        for key in keys:
             self.instance_disposed(key=key)
 # endregion
 
@@ -733,6 +737,10 @@ class MusicModeSocketConnectionFactory(SocketConnectionFactory):
 # endregion
 
 
+def scale(value, src, dst):
+    return ((dst[1] - dst[0]) * (value - src[0]) / (src[1] - src[0])) + dst[0]
+
+
 class YeelightProtocol(Protocol):
     """
     Class containing an implementation of Protocol for Yeelight bulbs.
@@ -786,6 +794,7 @@ class YeelightProtocol(Protocol):
             b = hex_rgb[-2:]
             if b == "  ":
                 b = "00"
+            state["rgb"] = int(hue_data[0])
             state["xy"] = convert_rgb_xy(int(r, 16), int(g, 16), int(b, 16))
             state["colormode"] = "xy"
         elif data["result"][0] == "2":  # ct mode
@@ -818,7 +827,8 @@ class YeelightProtocol(Protocol):
                 "data": {},
                 "timer": None,
                 "count": 0,
-                "delay": None
+                "delay": None,
+                "prev": None
             }
 
         queued_data = self._queued_set_light_data[ip]
@@ -848,29 +858,45 @@ class YeelightProtocol(Protocol):
                 queued_data["timer"] = self.event_loop.call_soon_threadsafe(
                     lambda: self.event_loop.call_at((last_time + delay) / 1000, callback))
         else:
-            logging.debug(
-                "last set_light call for %s was %f ms ago, already queued", ip, now - last_time)
+            if now - last_time > 3000:
+                # Watchdog: if future was more than 3s ago, and still not executed, clear it
+                logging.debug(
+                    "last set_light call for %s was %f ms ago, already queued but dequeuing anyway due to possible failure to execute", ip, now - last_time)
+                callback()
+            else:
+                logging.debug(
+                    "last set_light call for %s was %f ms ago, already queued", ip, now - last_time)
 
     def dequeue_set_light_data(self, ip, light, data):
+        run_again = True
         try:
             self.run_commands(ip, light, data)
-
+        except:
+            run_again = False
         finally:
-            data["timestamp"] = self.event_loop.time() * 1000
+            now = self.event_loop.time() * 1000
+            delay = self.minimum_msec_between_commands_for_ip(ip)
+            data["timestamp"] = now
+            data["prev"] = copy.deepcopy(data["data"])
             data["data"] = {}
             data["timer"] = None
             data["count"] = 0
-            data["delay"] = None
+            data["delay"] = delay
+            data["timer"] = self.event_loop.call_at(
+                (now + delay) / 1000, partial(self.dequeue_set_light_data, ip, light, data)) if run_again and CONTINUOUS_TIMER else None
 # endregion
 
 # region Command executor
     def run_commands(self, ip, light, command_data):
+        data = command_data["data"]
+        if not command_data["data"]:
+            return
+
         try:
             connection = self.connection_factory.get_or_build(ip).result(5)
         except Exception as ex:
             raise
 
-        data = command_data["data"]
         if command_data["delay"] is not None and connection.mode != "music" and command_data["count"] >= 3:
             # More than 3 requests attempted within a small amount of time? turn music mode on
             try:
@@ -878,7 +904,10 @@ class YeelightProtocol(Protocol):
             except Exception as ex:
                 pass
 
-        payload = self.convert_to_payload(data, light)
+        payload = self.convert_to_payload(data, light, command_data["prev"])
+
+        if not payload:
+            return
 
         msg = ""
         for (method, params) in payload.items():
@@ -906,14 +935,20 @@ class YeelightProtocol(Protocol):
         return MINIMUM_MSEC_BETWEEN_COMMANDS
 # endregion
 
+
 # region Hue data to Yeelight payload converter method
-    def convert_to_payload(self, data, light):
+
+
+    def convert_to_payload(self, data, light, prev, updated_vals_only=True):
         payload = {}
 
         sudden = ["sudden", 50]
 
         will_transition = "rapid" not in data or RAPID_SMOOTH
         transition = sudden
+
+        if not prev:
+            updated_vals_only = False  # first update
 
         if will_transition:
             transition = [
@@ -927,8 +962,11 @@ class YeelightProtocol(Protocol):
                 payload["set_power"] = ["off", *transition]
 
         if "bri" in data:
-            payload["set_bright"] = [
-                int(data["bri"] / 2.55) + 1, *transition]
+            # range(1, 255) from hue (max: 254)
+            # range(1, 101) to yeelight (max: 100)
+            bri = int(scale(data["bri"], (1, 254), (1, 100)))
+            if not updated_vals_only or int(scale(prev.get("bri", 0), (1, 254), (1, 100))) != bri:
+                payload["set_bright"] = [bri, *transition]
 
         if "ct" in data:
             payload["set_ct_abx"] = [
@@ -939,21 +977,26 @@ class YeelightProtocol(Protocol):
                 int(data["hue"] / 182), int(data["sat"] / 2.54), *transition]
         elif "hue" in data and "sat" not in data:
             payload["set_hsv"] = [
-                int(data["hue"] / 182), int(light["state"]["sat"] / 2.54), *transition]
+                int(data["hue"] / 182), int(prev["sat"] / 2.54), *transition]
         elif "hue" in data and "sat" not in data:
             payload["set_hsv"] = [
-                int(light["state"]["hue"] / 182), int(data["sat"] / 2.54), *transition]
+                int(prev["hue"] / 182), int(data["sat"] / 2.54), *transition]
 
         if "rgb" in data:
-            color = data["rgb"]
-            payload["set_rgb"] = [
-                (color[0] * 65536) + (color[1] * 256) + color[2], *transition]
+            rgb = data["rgb"]
+            color = (rgb[0] * 65536) + (rgb[1] * 256) + rgb[2]
+
+            prev_rgb = prev.get("rgb", (-1, -1, -1)
+                                ) if updated_vals_only else None
+
+            if not updated_vals_only or rgb != prev_rgb:
+                payload["set_rgb"] = [color, *transition]
 
         elif "xy" in data:  # prefer rgb if possible over xy
             if "bri" in data:
                 bri = data["bri"]
             else:
-                bri = light["state"]["bri"]
+                bri = prev["bri"]
 
             color = convert_xy(data["xy"][0], data["xy"][1], bri)
             # according to docs, yeelight needs this to set rgb. its r * 65536 + g * 256 + b

@@ -187,7 +187,7 @@ def entertainmentService():
 
                                     if lightStatus[lightId]["on"]:
                                         if (r, g, b) != lightStatus[lightId]["rgb"]:
-                                            if abs(bri - lightStatus[lightId]["bri"]) > 0:
+                                            if abs(bri - lightStatus[lightId]["bri"]) >= 1:
                                                 patch.update({"bri": bri, "transitiontime": 3})
                                                 lightStatus[lightId]["bri"] = bri
 
