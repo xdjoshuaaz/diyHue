@@ -19,16 +19,16 @@ import copy
 # Minimum time between commands in socket mode
 MINIMUM_MSEC_BETWEEN_COMMANDS = 300
 # Minimum time between commands in music mode
-MINIMUM_MSEC_BETWEEN_COMMANDS_MUSIC = 30
+MINIMUM_MSEC_BETWEEN_COMMANDS_MUSIC = 50
 
 # Combine rgb + brightness commands: off (0), set_scene (1), start_flow (2, 50ms OR RAPID_SMOOTH_TRANSITION_TIME)
-COMBI_COMMANDS = 0
+COMBI_COMMANDS = 2
 # If true, use smooth transition instead of sudden when receiving rapid requests (from Hue Entertainment)
 RAPID_SMOOTH = True
 # If RAPID_SMOOTH is True, what should the smooth transition time be? Set to None to keep value from data
-RAPID_SMOOTH_TRANSITION_TIME = 30
+RAPID_SMOOTH_TRANSITION_TIME = 50
 
-CONTINUOUS_TIMER = True
+CONTINUOUS_TIMER = False
 
 # region Future factory
 
@@ -610,7 +610,7 @@ class SocketConnectionFactory(FutureFactory):
             connection = SocketConnection(ip, tcp_socket)
             try:
                 connection.disposed_subscribers.append(
-                    lambda s: self.instance_disposed(instance=s, key=ip, future=future))
+                    lambda: self.instance_disposed(instance=connection, key=ip, future=future))
                 connection.start()
             except:
                 connection.dispose()
@@ -698,6 +698,8 @@ class MusicModeSocketConnectionFactory(SocketConnectionFactory):
         server_ip = getIpAddress()
         logging.info("Setting music on for %s (to %s)",
                      connection.ip, server_ip)
+
+        connection.invoke_command("set_music", 0)
 
         command = connection.invoke_command(
             "set_music", 1, server_ip, 80)
@@ -828,7 +830,7 @@ class YeelightProtocol(Protocol):
                 "timer": None,
                 "count": 0,
                 "delay": None,
-                "prev": None
+                "prev": {}
             }
 
         queued_data = self._queued_set_light_data[ip]
@@ -862,7 +864,8 @@ class YeelightProtocol(Protocol):
                 # Watchdog: if future was more than 3s ago, and still not executed, clear it
                 logging.debug(
                     "last set_light call for %s was %f ms ago, already queued but dequeuing anyway due to possible failure to execute", ip, now - last_time)
-                callback()
+                queued_data["timer"] = self.event_loop.call_soon_threadsafe(
+                    callback)
             else:
                 logging.debug(
                     "last set_light call for %s was %f ms ago, already queued", ip, now - last_time)
@@ -877,7 +880,7 @@ class YeelightProtocol(Protocol):
             now = self.event_loop.time() * 1000
             delay = self.minimum_msec_between_commands_for_ip(ip)
             data["timestamp"] = now
-            data["prev"] = copy.deepcopy(data["data"])
+            data["prev"].update(data["data"])
             data["data"] = {}
             data["timer"] = None
             data["count"] = 0
@@ -937,7 +940,6 @@ class YeelightProtocol(Protocol):
 
 
 # region Hue data to Yeelight payload converter method
-
 
     def convert_to_payload(self, data, light, prev, updated_vals_only=True):
         payload = {}

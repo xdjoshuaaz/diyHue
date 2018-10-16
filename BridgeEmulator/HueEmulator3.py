@@ -1141,7 +1141,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                 protocol_name = light["protocol"]
 
                 for protocol in protocols:
-                    if "protocols." + protocol_name == protocol.__name__:
+                    if protocol_name == protocol.name:
                         self.request_handler_delegate = self.invoke_optional_method(protocol, "RequestHandlerDelegateClass", protocol, self, default=None)
                         break
                 break
