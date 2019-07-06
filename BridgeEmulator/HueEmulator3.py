@@ -1509,7 +1509,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                                         Popen(["killall", entertainment_srv]).wait(1)
                                     except subprocess.TimeoutExpired:
                                         pass
-                                    Popen(['./{0}'.format(entertainment_srv), "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
+                                    Popen(['./{0}'.format(entertainment_srv), "server_port=2100", "server_addr=" + HostIP, "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
                                     sleep(0.2)
                                     bridge_config["groups"][url_pices[4]]["stream"].update({"active": True, "owner": url_pices[2], "proxymode": "auto", "proxynode": "/bridge"})
                                 else:
