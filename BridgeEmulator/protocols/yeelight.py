@@ -11,7 +11,9 @@ from collections import namedtuple
 import asyncio
 import threading
 import socketserver
-from functions import light_types, nextFreeId, getIpAddress
+from functions import light_types, nextFreeId
+from functions.network import getIpAddress
+import sys
 from functions.colors import convert_rgb_xy, convert_xy
 from .base import Protocol
 import copy
@@ -463,7 +465,6 @@ class MusicModeSocketConnection(SocketConnection):
         self.request.finish()
         super().dispose()
 
-
 def discover(bridge_config, new_lights):
     group = ("239.255.255.250", 1982)
     message = "\r\n".join([
@@ -478,21 +479,22 @@ def discover(bridge_config, new_lights):
     sock.sendto(message.encode(), group)
     while True:
         try:
-            lines = sock.recv(1024).decode('utf-8').split("\r\n")
-            result = {key: value[0] if len(value) >= 1 else None for (key, *value) in [line.split(
-                ": ", 1) for line in lines]}
-            properties = {
-                "rgb": False if "rgb" not in result else True,
-                "ct": False if "ct" not in result else True
-            }
-
-            if "id" in result:
-                properties["id"] = result["id"]
-            if "Location" in result:
-                properties["ip"] = result["Location"][11:][:-6]
-            if "name" in result:
-                properties["name"] = result["name"]
-
+            response = sock.recv(1024).decode('utf-8').split("\r\n")
+            properties = {"rgb": False, "ct": False}
+            for line in response:
+                #logging.info("line check: " + line)
+                if line[:2] == "id":
+                    properties["id"] = line[4:]
+                elif line[:3] == "rgb":
+                    properties["rgb"] = True
+                elif line[:2] == "ct":
+                    properties["ct"] = True
+                elif line[:8] == "Location":
+                    properties["ip"] = line.split(":")[2][2:]
+                elif line[:4] == "name":
+                    properties["name"] = line[6:]
+                elif line[:5] == "model":
+                    properties["model"] = line.split(": ",1)[1]
             device_exist = False
             for light in bridge_config["lights_address"].keys():
                 if bridge_config["lights_address"][light]["protocol"] == "yeelight" and bridge_config["lights_address"][light]["id"] == properties["id"]:
@@ -502,11 +504,13 @@ def discover(bridge_config, new_lights):
                         "light id " + properties["id"] + " already exist, updating ip...")
                     break
             if (not device_exist):
-                light_name = "YeeLight id " + \
-                    properties["id"][-8:] if properties["name"] == "" else properties["name"]
+                #light_name = "YeeLight id " + properties["id"][-8:] if properties["name"] == "" else properties["name"]
+                light_name = "Yeelight " + properties["model"] + " " + properties["ip"][-3:] if properties["name"] == "" else properties["name"] #just for me :)
                 logging.debug("Add YeeLight: " + properties["id"])
                 modelid = "LWB010"
-                if properties["rgb"]:
+                if properties["model"] == "desklamp":
+                    modelid = "LTW001"
+                elif properties["rgb"]:
                     modelid = "LCT015"
                 elif properties["ct"]:
                     modelid = "LTW001"
@@ -783,36 +787,43 @@ class YeelightProtocol(Protocol):
             state['on'] = False
         state["bri"] = int(int(light_data[1]) * 2.54)
 
-        data = connection.invoke_command("get_prop", "color_mode").result(3)
-        if data["result"][0] == "1":  # rgb mode
-            data = connection.invoke_command("get_prop", "rgb").result(3)
-            hue_data = data["result"]
-            hex_rgb = "%6x" % int(hue_data[0])
-            r = hex_rgb[: 2]
-            if r == "  ":
-                r = "00"
-            g = hex_rgb[3: 4]
-            if g == "  ":
-                g = "00"
-            b = hex_rgb[-2:]
-            if b == "  ":
-                b = "00"
-            state["rgb"] = int(hue_data[0])
-            state["xy"] = convert_rgb_xy(int(r, 16), int(g, 16), int(b, 16))
-            state["colormode"] = "xy"
-        elif data["result"][0] == "2":  # ct mode
+        if light["name"].find("desklamp") > 0:
             data = connection.invoke_command("get_prop", "ct").result(3)
-            state["ct"] = int(
-                1000000 / int(data["result"][0]))
+            tempval = int(1000000 / int(data["result"][0]))
+            if tempval > 369: tempval = 369
+            state["ct"] = tempval # int(1000000 / int(json.loads(data[:-2].decode("utf8"))["result"][0]))
             state["colormode"] = "ct"
+        else:
+            data = connection.invoke_command("get_prop", "color_mode").result(3)
+            if data["result"][0] == "1":  # rgb mode
+                data = connection.invoke_command("get_prop", "rgb").result(3)
+                hue_data = data["result"]
+                hex_rgb = "%6x" % int(hue_data[0])
+                r = hex_rgb[: 2]
+                if r == "  ":
+                    r = "00"
+                g = hex_rgb[3: 4]
+                if g == "  ":
+                    g = "00"
+                b = hex_rgb[-2:]
+                if b == "  ":
+                    b = "00"
+                state["rgb"] = int(hue_data[0])
+                state["xy"] = convert_rgb_xy(int(r, 16), int(g, 16), int(b, 16))
+                state["colormode"] = "xy"
+            elif data["result"][0] == "2":  # ct mode
+                data = connection.invoke_command("get_prop", "ct").result(3)
+                state["ct"] = int(
+                    1000000 / int(data["result"][0]))
+                state["colormode"] = "ct"
 
-        elif data["result"][0] == "3":  # ct mode
-            data = connection.invoke_command(
-                "get_prop", "hue", "sat").result(3)
-            hue_data = data["result"]
-            state["hue"] = int(hue_data[0] * 182)
-            state["sat"] = int(int(hue_data[1]) * 2.54)
-            state["colormode"] = "hs"
+            elif data["result"][0] == "3":  # ct mode
+                data = connection.invoke_command(
+                    "get_prop", "hue", "sat").result(3)
+                hue_data = data["result"]
+                state["hue"] = int(hue_data[0] * 182)
+                state["sat"] = int(int(hue_data[1]) * 2.54)
+                state["colormode"] = "hs"
         return state
 
     def set_light(self, ip, light, data):
@@ -974,6 +985,9 @@ class YeelightProtocol(Protocol):
                 payload["set_bright"] = [bri, *transition]
 
         if "ct" in data:
+            #if ip[:-3] == "201" or ip[:-3] == "202":
+            if light["name"].find("desklamp") > 0:
+                if data["ct"] > 369: data["ct"] = 369
             payload["set_ct_abx"] = [
                 int(1000000 / data["ct"]), *transition]
 

@@ -1,4 +1,4 @@
-def description(ip, mac):
+def description(ip, mac, name):
     return """<?xml version="1.0" encoding="UTF-8" ?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
 <specVersion>
@@ -8,7 +8,7 @@ def description(ip, mac):
 <URLBase>http://""" + ip + """:80/</URLBase>
 <device>
 <deviceType>urn:schemas-upnp-org:device:Basic:1</deviceType>
-<friendlyName>Philips hue (""" + ip + """)</friendlyName>
+<friendlyName>""" + name + """ (""" + ip + """)</friendlyName>
 <manufacturer>Royal Philips Electronics</manufacturer>
 <manufacturerURL>http://www.philips.com</manufacturerURL>
 <modelDescription>Philips hue Personal Wireless Lighting</modelDescription>
@@ -165,8 +165,8 @@ def webformDeconz(bridge_config):
     for deconzSensor in bridge_config["deconz"]["sensors"].keys():
         if bridge_config["sensors"][bridge_config["deconz"]["sensors"][deconzSensor]["bridgeid"]]["modelid"] in ["TRADFRI remote control", "TRADFRI wireless dimmer"]:
             content += "<div class=\"pure-control-group\">\n"
-            content += "<label for=\"" + deconzSensor + "\">" + bridge_config["sensors"][bridge_config["deconz"]["sensors"][deconzSensor]["bridgeid"]]["name"] + "</label>\n"
-            content += "<select id=\"" + deconzSensor + "\" name=\"" + bridge_config["deconz"]["sensors"][deconzSensor]["bridgeid"] + "\">\n"
+            content += "<label for=\"sensor-" + deconzSensor + "\">" + bridge_config["sensors"][bridge_config["deconz"]["sensors"][deconzSensor]["bridgeid"]]["name"] + "</label>\n"
+            content += "<select id=\"sensor-" + deconzSensor + "\" name=\"" + bridge_config["deconz"]["sensors"][deconzSensor]["bridgeid"] + "\">\n"
             if bridge_config["sensors"][bridge_config["deconz"]["sensors"][deconzSensor]["bridgeid"]]["modelid"] == "TRADFRI remote control":
                 content += "<option value=\"ZGPSwitch\">Hue Tap Switch</option>\n"
                 content += "<option value=\"ZLLSwitch\">Hue Dimmer Switch</option>\n"
@@ -182,6 +182,18 @@ def webformDeconz(bridge_config):
                 content += "<option value=\"SCENE\" " + ("selected" if "opmode" in bridge_config["deconz"]["sensors"][deconzSensor] and bridge_config["deconz"]["sensors"][deconzSensor]["opmode"] == "SCENE" else "") +  ">Scene Switch</option>\n"
                 content += "</select>\n"
             content += "</div>\n"
+    content += "<legend>Tradfri Motion Sensors Setup</legend>\n"
+    for deconzSensor in bridge_config["deconz"]["sensors"].keys():
+        if bridge_config["deconz"]["sensors"][deconzSensor]["modelid"] == "TRADFRI motion sensor":
+            content += "<div class=\"pure-control-group\">\n"
+            content += "<label for=\"sensor-" + deconzSensor + "\">" + bridge_config["sensors"][bridge_config["deconz"]["sensors"][deconzSensor]["bridgeid"]]["name"] + "</label>\n"
+            content += "<select id=\"sensor-" + deconzSensor + "\" name=\"" + deconzSensor + "\">\n"
+            content += "<option value=\"internal\"" + ("selected" if bridge_config["deconz"]["sensors"][deconzSensor]["lightsensor"] == "internal" else "") + ">Internal</option>\n"
+            content += "<option value=\"astral\"" + ("selected" if bridge_config["deconz"]["sensors"][deconzSensor]["lightsensor"] == "astral" else "") + ">Astral</option>\n"
+            content += "<option value=\"combined\"" + ("selected" if bridge_config["deconz"]["sensors"][deconzSensor]["lightsensor"] == "combined" else "") + ">Combined</option>\n"
+            content += "<option value=\"none\"" + ("selected" if bridge_config["deconz"]["sensors"][deconzSensor]["lightsensor"] == "none" else "") + ">None</option>\n"
+            content += "</select>\n"
+            content += "</div>\n"
     content += """<div class="pure-controls">
 <button type=\"submit\" class=\"pure-button pure-button-primary\">Save</button></div>
 </div>
@@ -190,3 +202,39 @@ def webformDeconz(bridge_config):
 </body>
 </html>"""
     return content
+
+
+def lightsHttp():
+    return """<!DOCTYPE html>
+<html style="height: 100%">
+
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="https://diyhue.org/cdn/bootstrap.min.css">
+  <script src="https://diyhue.org/cdn/jquery-3.3.1.min.js"></script>
+</head>
+
+<body>
+<table class="table">
+  <thead>
+    <tr>
+      <th scope="col">#</th>
+      <th scope="col">Name</th>
+      <th scope="col">Current Version</th>
+      <th scope="col">Last Vesion</th>
+      <th scope="col"></th>
+    </tr>
+  </thead>
+  <tbody>
+  </tbody>
+</table>
+<script>
+jQuery.getJSON("/lights.json", function(data) {
+    for (var key in data) {
+    $('.table').append('<tr><th scope="row">#' + key +'</th><td>' + data[key]["name"] +'</td><td>' + data[key]["currentVersion"] +'</td><td>' + data[key]["lastVersion"] +'</td><td>' + ((data[key]["currentVersion"] < data[key]["lastVersion"]) ? '<a href="/lights?light=' + key + '&filename=' + data[key]["firmware"] +'">update</a>' : 'up to date') + '</td></tr>');
+    var value = data[key];
+    }
+});
+</script>
+</body>
+</html>"""
