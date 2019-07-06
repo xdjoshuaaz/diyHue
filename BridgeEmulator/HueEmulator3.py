@@ -73,6 +73,8 @@ else:
     HostIP = getIpAddress()
     print("Using Host IP of " + HostIP)
 
+yeelight.ip = HostIP
+
 if args.mac:
     dockerMAC = args.mac
     mac = str(args.mac).replace(":","")
@@ -170,7 +172,7 @@ def setServerConfig():
     else:
         logging.info('Using %s for Entertainment API', entertainment_srv)
 
-    ip = getIpAddress()
+    ip = HostIP
     ip_components = ip.split(".")
     bridge_config["config"]["ipaddress"] = ip
     bridge_config["config"]["gateway"] = ip_components[0] + "." +  ip_components[1] + "." + ip_components[2] + ".1"
