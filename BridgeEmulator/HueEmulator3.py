@@ -73,7 +73,7 @@ else:
     HostIP = getIpAddress()
     print("Using Host IP of " + HostIP)
 
-yeelight.ip = HostIP
+yeelight.server_ip = HostIP
 
 if args.mac:
     dockerMAC = args.mac

@@ -34,7 +34,7 @@ CONTINUOUS_TIMER = False
 
 # region Future factory
 
-ip = ''
+server_ip = ''
 
 class FutureFactory:
     """
@@ -703,7 +703,6 @@ class MusicModeSocketConnectionFactory(SocketConnectionFactory):
         timeout: int
             Seconds before music mode connection attempt times out
         """
-        server_ip = ip
         logging.info("Setting music on for %s (to %s)",
                      connection.ip, server_ip)
 
