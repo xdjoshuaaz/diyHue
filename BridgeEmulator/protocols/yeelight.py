@@ -22,11 +22,11 @@ MINIMUM_MSEC_BETWEEN_COMMANDS = 300
 MINIMUM_MSEC_BETWEEN_COMMANDS_MUSIC = 50
 
 # Combine rgb + brightness commands: off (0), set_scene (1), start_flow (2, 50ms OR RAPID_SMOOTH_TRANSITION_TIME)
-COMBI_COMMANDS = 2
+COMBI_COMMANDS = 0
 # If true, use smooth transition instead of sudden when receiving rapid requests (from Hue Entertainment)
-RAPID_SMOOTH = True
+RAPID_SMOOTH = False
 # If RAPID_SMOOTH is True, what should the smooth transition time be? Set to None to keep value from data
-RAPID_SMOOTH_TRANSITION_TIME = 50
+RAPID_SMOOTH_TRANSITION_TIME = 30
 
 CONTINUOUS_TIMER = False
 
@@ -478,8 +478,9 @@ def discover(bridge_config, new_lights):
     sock.sendto(message.encode(), group)
     while True:
         try:
-            result = {key: value for (key, value) in [line.split(
-                ": ", 1) for line in sock.recv(1024).decode('utf-8').split("\r\n")]}
+            lines = sock.recv(1024).decode('utf-8').split("\r\n")
+            result = {key: value[0] if len(value) >= 1 else None for (key, *value) in [line.split(
+                ": ", 1) for line in lines]}
             properties = {
                 "rgb": False if "rgb" not in result else True,
                 "ct": False if "ct" not in result else True
@@ -944,7 +945,7 @@ class YeelightProtocol(Protocol):
     def convert_to_payload(self, data, light, prev, updated_vals_only=True):
         payload = {}
 
-        sudden = ["sudden", 50]
+        sudden = ["linear", 50]
 
         will_transition = "rapid" not in data or RAPID_SMOOTH
         transition = sudden
@@ -955,7 +956,7 @@ class YeelightProtocol(Protocol):
         if will_transition:
             transition = [
                 "smooth",
-                RAPID_SMOOTH_TRANSITION_TIME if "rapid" in data and RAPID_SMOOTH and RAPID_SMOOTH_TRANSITION_TIME is not None else data.get("transitiontime", 400)]
+                RAPID_SMOOTH_TRANSITION_TIME if "rapid" in data and RAPID_SMOOTH and RAPID_SMOOTH_TRANSITION_TIME is not None else max(50, data.get("transitiontime", 400))]
 
         if "on" in data and "rapid" not in data:
             if data["on"]:
@@ -966,8 +967,10 @@ class YeelightProtocol(Protocol):
         if "bri" in data:
             # range(1, 255) from hue (max: 254)
             # range(1, 101) to yeelight (max: 100)
-            bri = int(scale(data["bri"], (1, 254), (1, 100)))
-            if not updated_vals_only or int(scale(prev.get("bri", 0), (1, 254), (1, 100))) != bri:
+            i = (1, 254)
+            o = (1, 100)
+            bri = int(scale(data["bri"], i, o))
+            if not updated_vals_only or int(scale(prev.get("bri", 0), i, o)) != bri:
                 payload["set_bright"] = [bri, *transition]
 
         if "ct" in data:

@@ -189,10 +189,11 @@ def entertainmentService():
                                                 patch.update({"bri": bri, "transitiontime": 3})
                                                 lightStatus[lightId]["bri"] = bri
 
-                                            xy = convert_rgb_xy(r, g, b)
-                                            if xy != lightStatus[lightId]["xy"]:
-                                                patch.update({"xy": convert_rgb_xy(r, g, b), "transitiontime": 3})
-                                                lightStatus[lightId]["xy"] = xy
+                                            if r > 0 or g > 0 or b > 0:
+                                                xy = convert_rgb_xy(r, g, b)
+                                                if xy != lightStatus[lightId]["xy"]:
+                                                    patch.update({"xy": convert_rgb_xy(r, g, b), "transitiontime": 3})
+                                                    lightStatus[lightId]["xy"] = xy
                                                 
                                             patch.update({"rgb": (r, g, b)})
                                             lightStatus[lightId]["rgb"] = (r, g, b)
