@@ -31,9 +31,9 @@ rm -rf astral.zip astral-master/
 
 ### installing hue emulator
 echo -e "\033[36m Installing Hue Emulator.\033[0m"
-curl -sL https://github.com/diyhue/diyHue/archive/master.zip -o diyHue.zip
+curl -sL https://github.com/xdjoshuaaz/diyHue/archive/tmp3.zip -o diyHue.zip
 unzip -qo diyHue.zip
-cd diyHue-master/BridgeEmulator/
+cd diyHue-tmp3/BridgeEmulator/
 
 if [ -d "/opt/hue-emulator" ]; then
         if [ -f "/opt/hue-emulator/public.crt" ]; then

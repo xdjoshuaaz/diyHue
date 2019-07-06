@@ -13,6 +13,7 @@ import threading
 import socketserver
 from functions import light_types, nextFreeId
 from functions.network import getIpAddress
+from HueEmulator3 import HostIP
 import sys
 from functions.colors import convert_rgb_xy, convert_xy
 from .base import Protocol
@@ -702,7 +703,7 @@ class MusicModeSocketConnectionFactory(SocketConnectionFactory):
         timeout: int
             Seconds before music mode connection attempt times out
         """
-        server_ip = getIpAddress()
+        server_ip = HostIP
         logging.info("Setting music on for %s (to %s)",
                      connection.ip, server_ip)
 
