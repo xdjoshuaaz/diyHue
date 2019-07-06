@@ -7,8 +7,8 @@ import socket
 import sys
 
 from time import sleep
-from subprocess import check_output
 from functions import light_types, nextFreeId
+from functions.xplat import check_output
 from functions.colors import convert_rgb_xy, convert_xy
 from functions.network import getIpAddress
 

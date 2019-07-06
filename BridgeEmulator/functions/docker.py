@@ -1,5 +1,5 @@
 import os
-from subprocess import call
+from functions.xplat import call
 from shutil import copyfile
 import requests
 

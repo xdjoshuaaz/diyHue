@@ -17,11 +17,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 import platform
 import shutil
-from subprocess import Popen, check_output, call
 from threading import Thread, current_thread
 from time import sleep, strftime
 from urllib.parse import parse_qs, urlparse
 from functions import light_types, nextFreeId
+import functions.xplat as xplat
+from functions.xplat import Popen, check_output
 from functions.colors import convert_rgb_xy, convert_xy, hsv_to_rgb
 from functions.html import (description, webform_hue, webform_linkbutton,
                             webform_milight, webformDeconz, webformTradfri, lightsHttp)
@@ -50,12 +51,14 @@ ap.add_argument("--deconz", help="Provide the IP address of your Deconz host. 12
 
 args = ap.parse_args()
 
+debug = False
 if (args.debug and (args.debug == "true" or args.debug == "True")) or (os.getenv('DEBUG') and (os.getenv('DEBUG') == "true" or os.getenv('DEBUG') == "True")):
     print("Debug Enabled")
+    debug = True
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(logging.DEBUG)
     ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
+    ch.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     ch.setFormatter(formatter)
     root.addHandler(ch)
@@ -132,8 +135,6 @@ else:
   deconz_ip = "127.0.0.1"
 logging.info(deconz_ip)
 
-protocols = [yeelight, tasmota, native_single, native_multi]
-
 cwd = os.path.split(os.path.abspath(__file__))[0]
 
 def pretty_json(data):
@@ -145,34 +146,9 @@ bridge_config = defaultdict(lambda:defaultdict(str))
 new_lights = {}
 sensors_state = {}
 
-def checkEnvironment():
-    global linux_compatible
-    linux_compatible = True
 
-    logging.info('Running on %s', platform.system())
-    if (platform.system() == 'Windows'):
-        wsl = shutil.which("wsl.exe")
-        linux_compatible = wsl is not None
-        has_specified_args = len(sys.argv) >= 2
-
-        logging.info("WSL path: %s", wsl)
-
-        if not linux_compatible and not has_specified_args:
-            raise Exception('''Running on Windows requires either that;
-            a) the Windows Subsystem for Linux (WSL, aka Bash on Ubuntu on Windows) is installed,
-            b) host MAC and IP addresses are passed as command-line arguments in the order shown respectively.
-
-            To install WSL, visit https://docs.microsoft.com/en-us/windows/wsl/install-win10 ''')
 
 def setServerConfig():
-    global mac
-    if len(sys.argv) == 3:
-        mac = str(sys.argv[1]).replace(":", "")
-        logging.info("MAC %s from cmd args", mac)
-    else:
-        mac = xplat_check_output("cat /sys/class/net/$(ip -o addr | grep " + getIpAddress() + " | awk '{print $2}')/address", shell=True).decode('utf-8').replace(":", "")[:-1]
-        logging.info("MAC %s from bash", mac)
-
     global entertainment_srv
     entertainment_srv = None
     file_platform_map = {
@@ -180,7 +156,7 @@ def setServerConfig():
         'amd64': 'entertainment-x86_64'
     }
 
-    if not linux_compatible:
+    if not xplat.linux_compatible:
         logging.warn('The Hue Entertainment API will not run on Windows without the Windows Subsystem for Linux (https://docs.microsoft.com/en-us/windows/wsl/install-win10)')
     elif os.path.isfile('entertainment-srv'):
         entertainment_srv = 'entertainment-srv'
@@ -201,25 +177,6 @@ def setServerConfig():
     bridge_config["config"]["mac"] = mac[0] + mac[1] + ":" + mac[2] + mac[3] + ":" + mac[4] + mac[5] + ":" + mac[6] + mac[7] + ":" + mac[8] + mac[9] + ":" + mac[10] + mac[11]
     bridge_config["config"]["bridgeid"] = (mac[:6] + 'FFFE' + mac[6:]).upper()
 
-
-
-def xplat_check_output(*args, **kwargs):
-    cmd = args[0]
-
-    if (platform.system() == 'Windows'):
-        cmd = [cmd[0:cmd.index(' ')], cmd[1+cmd.index(' '):]] if isinstance(cmd, str) else cmd
-        cmd = ["wsl", *cmd]
-
-    return check_output(cmd, *args[1:], **kwargs)
-
-def xplat_Popen(*args, **kwargs):
-    cmd = args[0]
-
-    if (platform.system() == 'Windows'):
-        cmd = [cmd[0:cmd.index(' ')], cmd[1+cmd.index(' '):]] if isinstance(cmd, str) else cmd
-        cmd = ["wsl", *cmd]
-
-    return Popen(cmd, *args[1:], **kwargs)
 def getLightsVersions():
     lights = {}
     githubCatalog = json.loads(requests.get('https://raw.githubusercontent.com/diyhue/Lights/master/catalog.json').text)
@@ -381,7 +338,7 @@ def saveConfig(filename='config.json'):
     with open(cwd + '/' + filename, 'w', encoding="utf-8") as fp:
         json.dump(bridge_config, fp, sort_keys=True, indent=4, separators=(',', ': '))
     if docker:
-        xplat_Popen(["cp", cwd + '/' + filename, cwd + '/' + 'export/'])
+        Popen(["cp", cwd + '/' + filename, cwd + '/' + 'export/'])
 
 def generateSensorsState():
     for sensor in bridge_config["sensors"]:
@@ -1090,7 +1047,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                 protocol_name = light["protocol"]
 
                 for protocol in protocols:
-                    if protocol_name == protocol.name:
+                    if 'protocols.' + protocol_name == protocol.__name__:
                         self.request_handler_delegate = self.invoke_optional_method(protocol, "RequestHandlerDelegateClass", protocol, self, default=None)
                         break
                 break
@@ -1385,7 +1342,7 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                 bridge_config["config"]["UTC"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
                 bridge_config["config"]["localtime"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
                 bridge_config["config"]["whitelist"][url_pices[2]]["last use date"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                bridge_config["config"]["linkbutton"] = int(bridge_config["linkbutton"]["lastlinkbuttonpushed"]) + 30 >= int(datetime.now().strftime("%s"))
+                bridge_config["config"]["linkbutton"] = int(bridge_config["linkbutton"]["lastlinkbuttonpushed"]) + 30 >= datetime.now().timestamp()
                 if len(url_pices) == 3: #print entire config
                     self._set_end_headers(bytes(json.dumps({"lights": bridge_config["lights"], "groups": bridge_config["groups"], "config": bridge_config["config"], "scenes": bridge_config["scenes"], "schedules": bridge_config["schedules"], "rules": bridge_config["rules"], "sensors": bridge_config["sensors"], "resourcelinks": bridge_config["resourcelinks"]},separators=(',', ':'),ensure_ascii=False), "utf8"))
                 elif len(url_pices) == 4: #print specified object config
@@ -1543,14 +1500,14 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                 elif url_pices[3] == "groups" and "stream" in put_dictionary:
                     if "active" in put_dictionary["stream"]:
                         if put_dictionary["stream"]["active"]:
-                            if linux_compatible:
+                            if xplat.linux_compatible:
                                 if entertainment_srv is not None:
                                     logging.info("start hue entertainment")
                                     try:
-                                        xplat_Popen(["killall", entertainment_srv]).wait(1)
+                                        Popen(["killall", entertainment_srv]).wait(1)
                                     except subprocess.TimeoutExpired:
                                         pass
-                                    xplat_Popen(['./{0}'.format(entertainment_srv), "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
+                                    Popen(['./{0}'.format(entertainment_srv), "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
                                     sleep(0.2)
                                     bridge_config["groups"][url_pices[4]]["stream"].update({"active": True, "owner": url_pices[2], "proxymode": "auto", "proxynode": "/bridge"})
                                 else:
@@ -1559,9 +1516,9 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                                 logging.warn("Could not start Hue Entertainment server: system must be capable of running Linux binaries")
                         else:
                             logging.info("stop hue entertainent")
-                            if linux_compatible:
+                            if xplat.linux_compatible:
                                 try:
-                                    xplat_Popen(["killall", entertainment_srv]).wait(1)
+                                    Popen(["killall", entertainment_srv]).wait(1)
                                 except subprocess.TimeoutExpired:
                                     pass
                             bridge_config["groups"][url_pices[4]]["stream"].update({"active": False, "owner": None})
@@ -1590,14 +1547,14 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                         if "active" in put_dictionary:
                             if put_dictionary["active"]:
                                 logging.info("start hue entertainment")
-                                if linux_compatible:
+                                if xplat.linux_compatible:
                                     if entertainment_srv is not None:
                                         logging.info("start hue entertainment")
                                         try:
-                                            xplat_Popen(["killall", entertainment_srv]).wait(1)
+                                            Popen(["killall", entertainment_srv]).wait(1)
                                         except subprocess.TimeoutExpired:
                                             pass
-                                        xplat_Popen(['./{0}'.format(entertainment_srv), "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
+                                        Popen(['./{0}'.format(entertainment_srv), "server_port=2100", "dtls=1", "psk_list=" + url_pices[2] + ",321c0c2ebfa7361e55491095b2f5f9db"])
                                         sleep(0.2)
                                         bridge_config["groups"][url_pices[4]]["stream"].update({"active": True, "owner": url_pices[2], "proxymode": "auto", "proxynode": "/bridge"})
                                     else:
@@ -1605,9 +1562,9 @@ class HueEmulatorRequestHandler(BaseHTTPRequestHandler):
                                 else:
                                     logging.warn("Could not start Hue Entertainment server: system must be capable of running Linux binaries")
                             else:
-                                if linux_compatible:
+                                if xplat.linux_compatible:
                                     try:
-                                        xplat_Popen(["killall", entertainment_srv]).wait(1)
+                                        Popen(["killall", entertainment_srv]).wait(1)
                                     except subprocess.TimeoutExpired:
                                         pass
 
@@ -1701,7 +1658,7 @@ class ThreadingSimpleServer(ThreadingMixIn, HTTPServer):
 
 def run(https, server_class=ThreadingSimpleServer, handler_class=HueEmulatorRequestHandler):
     if https:
-        server_address = ('', 443)
+        server_address = (HostIP, 443)
         httpd = server_class(server_address, handler_class)
         ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ctx.load_cert_chain(certfile="./cert.pem")
@@ -1714,22 +1671,13 @@ def run(https, server_class=ThreadingSimpleServer, handler_class=HueEmulatorRequ
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         logging.info('Starting ssl httpd...')
     else:
-        server_address = ('', 80)
+        server_address = (HostIP, 80)
         httpd = server_class(server_address, handler_class)
         logging.info('Starting httpd...')
     httpd.serve_forever()
     httpd.server_close()
 
-if __name__ == "__main__":
-    if debug:
-        root = logging.getLogger()
-        root.setLevel(logging.DEBUG)
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        ch.setFormatter(formatter)
-        root.addHandler(ch)
-        
+if __name__ == "__main__":        
     # load config files
     try:
         with open(cwd +'/config.json', 'r') as fp:
@@ -1739,11 +1687,9 @@ if __name__ == "__main__":
         logging.exception("CRITICAL! Config file was not loaded")
         sys.exit(1)
 
-    protocols = [YeelightProtocol()]
-
     loadConfig()
     generateSensorsState()
-    checkEnvironment()
+    xplat.checkEnvironment()
     setServerConfig()
     updateConfig()
     Thread(target=resourceRecycle).start()

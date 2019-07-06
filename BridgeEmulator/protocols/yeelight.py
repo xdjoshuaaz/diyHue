@@ -26,9 +26,9 @@ MINIMUM_MSEC_BETWEEN_COMMANDS_MUSIC = 50
 # Combine rgb + brightness commands: off (0), set_scene (1), start_flow (2, 50ms OR RAPID_SMOOTH_TRANSITION_TIME)
 COMBI_COMMANDS = 0
 # If true, use smooth transition instead of sudden when receiving rapid requests (from Hue Entertainment)
-RAPID_SMOOTH = False
+RAPID_SMOOTH = True
 # If RAPID_SMOOTH is True, what should the smooth transition time be? Set to None to keep value from data
-RAPID_SMOOTH_TRANSITION_TIME = 30
+RAPID_SMOOTH_TRANSITION_TIME = 50
 
 CONTINUOUS_TIMER = False
 
@@ -564,8 +564,7 @@ class YeelightRequestHandlerDelegate():
         ip = self.request_handler.client_address[0]
 
         logging.info("%s incoming connection by music mode", ip)
-        music_mode_connection = self.protocol.connection_factory.music_sockets.get(
-            ip)
+        music_mode_connection = self.protocol.connection_factory.music_sockets.get(ip)
         if music_mode_connection is not None and music_mode_connection.done() and not music_mode_connection.cancelled():
             try:
                 if music_mode_connection.result().request == self.request_handler:
@@ -576,11 +575,14 @@ class YeelightRequestHandlerDelegate():
                     music_mode_connection.result().dispose()
             except:
                 pass  # connection in error state shouldn't happen
+        
+        self.request_handler.close_connection = False
 
         connection = MusicModeSocketConnection(ip, self.request_handler)
         self.protocol.connection_factory.music_sockets.connection_established(
             connection)
         connection.start()
+
 
         return True
 # endregion
@@ -752,7 +754,7 @@ class YeelightProtocol(Protocol):
     """
     Class containing an implementation of Protocol for Yeelight bulbs.
     """
-    name = "yeelight"
+    __name__ = "protocols.yeelight"
 
     def __init__(self):
         self._sockets = SocketConnectionFactory()
@@ -769,11 +771,11 @@ class YeelightProtocol(Protocol):
                target=self.event_loop.run_forever).start()
 
 # region Protocol implementation
-    def get_light_state(self, ip, light):
+    def get_light_state(self, address, light):
         state = {}
         try:
             connection = self.connection_factory.get_or_build(
-                ip, music=False).result(5)
+                address["ip"], music=False).result(5)
         except Exception as ex:
             raise
 
@@ -826,11 +828,11 @@ class YeelightProtocol(Protocol):
                 state["colormode"] = "hs"
         return state
 
-    def set_light(self, ip, light, data):
+    def set_light(self, address, light, data):
         if "transitiontime" in data:
             data["transitiontime"] = data["transitiontime"] * 100
 
-        self.enqueue_set_light_data(ip, light, data)
+        self.enqueue_set_light_data(address["ip"], light, data)
 # endregion
 
 # region Command queueing methods
@@ -912,7 +914,7 @@ class YeelightProtocol(Protocol):
         except Exception as ex:
             raise
 
-        if command_data["delay"] is not None and connection.mode != "music" and command_data["count"] >= 3:
+        if True or (command_data["delay"] is not None and connection.mode != "music" and command_data["count"] >= 3):
             # More than 3 requests attempted within a small amount of time? turn music mode on
             try:
                 self.connection_factory.music_sockets.get_or_build(connection)
@@ -966,7 +968,7 @@ class YeelightProtocol(Protocol):
 
         if will_transition:
             transition = [
-                "smooth",
+                "linear",
                 RAPID_SMOOTH_TRANSITION_TIME if "rapid" in data and RAPID_SMOOTH and RAPID_SMOOTH_TRANSITION_TIME is not None else max(50, data.get("transitiontime", 400))]
 
         if "on" in data and "rapid" not in data:
